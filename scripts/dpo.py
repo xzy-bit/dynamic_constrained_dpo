@@ -112,19 +112,24 @@ def main(script_args, training_args, model_args):
     # Dataset
     #########
     dataset = get_dataset(script_args)
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
+    dataset = dataset["train_prefs"]
+    #dataset = datasets.load_from_disk(script_args.dataset_name)
+    dataset = dataset.remove_columns(['prompt', 'messages'])
 
     ##########
     # Training
     ##########
+    #def formatting_func(example):
+    #    return tokenizer.apply_chat_template(example["messages"], tokenize=False)
+
     trainer = DPOTrainer(
         model,
         ref_model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        train_dataset=dataset,
+        #train_dataset=dataset[script_args.dataset_train_split],
+        #eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        #formatting_func=formatting_func,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
     )
@@ -136,10 +141,10 @@ def main(script_args, training_args, model_args):
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    metrics = train_result.metrics
-    metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
-    trainer.log_metrics("train", metrics)
-    trainer.save_metrics("train", metrics)
+    #metrics = train_result.metrics
+    #metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
+    #trainer.log_metrics("train", metrics)
+    #trainer.save_metrics("train", metrics)
     trainer.save_state()
 
     if training_args.eval_strategy != "no":

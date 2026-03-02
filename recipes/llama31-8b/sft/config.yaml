@@ -5,26 +5,23 @@ torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
+#dataset_name: ./ultrachat_small
+dataset_name: HuggingFaceH4/ultrachat_200k
+dataset_config: default
+dataset_train_split: train_sft
 chat_template: "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-dataset_mixture:
-  datasets:
-    - id: HuggingFaceH4/ultrachat_200k
-      config: default
-      split: train_sft            
-      columns:
-        - messages
-      weight: 1.0
-  test_split_size: 0.05
-  seed: 0
-dataset_num_proc: 24
 
 # SFT trainer config
 bf16: true
 dataset_kwargs:
   add_special_tokens: false  # We already wrap <bos> and <eos> in the chat template
   append_concat_token: false # No need to add <eos> across samples
+  remove_columns:
+    - prompt
+    - prompt_id
+
 do_eval: false
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 2
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
@@ -33,12 +30,12 @@ log_level: info
 logging_steps: 5
 logging_strategy: steps
 lr_scheduler_type: cosine
-max_seq_length: 2048
+max_length: 2048
 max_steps: -1
 num_train_epochs: 1
 output_dir: results/model/llama3-8b_sft
 overwrite_output_dir: true
-per_device_train_batch_size: 8
+per_device_train_batch_size: 16
 push_to_hub: false
 remove_unused_columns: true
 report_to:

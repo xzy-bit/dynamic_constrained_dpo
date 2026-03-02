@@ -3,18 +3,11 @@ model_name_or_path: results/model/llama3-8b_sft
 torch_dtype: bfloat16
 
 # Data training arguments
-dataset_mixture:
-  datasets:
-    - id: HuggingFaceH4/ultrafeedback_binarized
-      config: default
-      split: train
-      columns:
-        - chosen
-        - rejected
-      weight: 1.0
-  test_split_size: 500
-  seed: 0
-dataset_num_proc: 12
+#dataset_name: ./dpo_small
+dataset_name: HuggingFaceH4/ultrafeedback_binarized
+dataset_config: default
+dataset_train_split: train_prefs
+
 
 # DPOTrainer arguments
 bf16: true
