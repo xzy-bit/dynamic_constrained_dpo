@@ -64,28 +64,31 @@ def _get_batch_ent_score(
     flat_loss = entmax_bisect_loss(flat_logits, flat_labels, alpha, n_iter=50)  # [B*(M-1)]
     token_loss = flat_loss.view(B, M - 1)
 
-    #if ispos:
-    #    if alpha == 1.5:
-    #        entmax_probs = entmax15(flat_logits, dim=-1)
-    #    else:
-    #        entmax_probs = entmax_bisect(flat_logits, alpha=alpha, dim=-1, n_iter=50)
+    tail = 0.0
+    if ispos:
+       if alpha == 1.5:
+           entmax_probs = entmax15(flat_logits, dim=-1)
+       else:
+           entmax_probs = entmax_bisect(flat_logits, alpha=alpha, dim=-1, n_iter=50)
 
-    #    softmax_probs = F.softmax(flat_logits, dim=-1)
+       softmax_probs = F.softmax(flat_logits, dim=-1)
 
-    #    one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
-    #    tail_mask = (entmax_probs == 0.0) & (~one_hot)
+       one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
+       tail_mask = (entmax_probs == 0.0) & (~one_hot)
 
-    #    suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
-    #    suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
+       suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
+       suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
 
-    #    ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M-1)]
-    #    ns_loss = ns_loss.view(B, M - 1)
+       ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M-1)]
+       ns_loss = ns_loss.view(B, M - 1)
 
-    #    token_loss = token_loss + beta * ns_loss - beta * ns_loss.detach()
+       ns_loss = beta * ns_loss * mask
+       tail = ns_loss.sum(-1)
 
     token_loss = token_loss * mask
     scores = -token_loss.sum(-1)   # [B]
-    return scores
+
+    return scores, tail
 
 class SPDPOTrainer(DPOTrainer):
     def __init__(
@@ -122,6 +125,7 @@ class SPDPOTrainer(DPOTrainer):
         rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
         return loss.mean(), chosen_rewards, rejected_rewards
+
     def concatenated_forward(self, model, batch):
         prompt_attention_mask = batch["prompt_attention_mask"]
 
@@ -179,11 +183,11 @@ class SPDPOTrainer(DPOTrainer):
 
         # 4) 用 entmax/sparsemax-family 的“序列级分数”作为 logps（否则你返回 0 学不到）
         #    通常把 chosen 当作 ispos=True，rejected 当作 ispos=False
-        chosen_logps = _get_batch_ent_score(
+        chosen_logps, chosen_tail = _get_batch_ent_score(
             chosen_logits, chosen_labels,
             alpha=self.sp_alpha, beta=self.sp_beta, ispos=True
         )
-        rejected_logps = _get_batch_ent_score(
+        rejected_logps, _ = _get_batch_ent_score(
             rejected_logits, rejected_labels,
             alpha=self.sp_alpha, beta=self.sp_beta, ispos=False
         )
@@ -195,6 +199,7 @@ class SPDPOTrainer(DPOTrainer):
             "rejected_labels": rejected_labels,
             "chosen_logps": chosen_logps,
             "rejected_logps": rejected_logps,
+            "chosen_tail": chosen_tail,
             
             "mean_chosen_logits": chosen_logits.mean(),
             "mean_rejected_logits": rejected_logits.mean(),
@@ -202,3 +207,41 @@ class SPDPOTrainer(DPOTrainer):
             "mean_chosen_logps": chosen_logps.mean(),
             "mean_rejected_logps": rejected_logps.mean(),
             }
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+
+        policy_out = self.concatenated_forward(model, inputs)
+        policy_chosen_logps = policy_out["chosen_logps"]
+        policy_rejected_logps = policy_out["rejected_logps"]
+        tail_loss = policy_out.get("chosen_tail", None)  # [B]
+
+        # reference forward
+        if self.reference_free or self.ref_model is None:
+            ref_chosen_logps = torch.zeros_like(policy_chosen_logps)
+            ref_rejected_logps = torch.zeros_like(policy_rejected_logps)
+        else:
+            with torch.no_grad():
+                ref_out = self.concatenated_forward(self.ref_model, inputs)
+            ref_chosen_logps = ref_out["chosen_logps"]
+            ref_rejected_logps = ref_out["rejected_logps"]
+
+        dpo_loss, chosen_rewards, rejected_rewards = self.dpo_loss(
+            policy_chosen_logps=policy_chosen_logps,
+            policy_rejected_logps=policy_rejected_logps,
+            reference_chosen_logps=ref_chosen_logps,
+            reference_rejected_logps=ref_rejected_logps,
+        )
+
+        loss = dpo_loss + tail_loss
+
+        if return_outputs:
+            policy_out = dict(policy_out)
+            policy_out.update({
+                "loss_dpo": dpo_loss.detach(),
+                "loss_tail": (tail_loss.detach() if isinstance(tail_loss, torch.Tensor) else torch.tensor(tail_loss)),
+                "chosen_rewards": chosen_rewards,
+                "rejected_rewards": rejected_rewards,
+            })
+            return loss, policy_out
+
+        return loss

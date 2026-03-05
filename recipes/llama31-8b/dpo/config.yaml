@@ -28,7 +28,7 @@ num_train_epochs: 1
 optim: adamw_torch
 adam_beta1: 0.9
 adam_beta2: 0.999
-output_dir: results/model/llama3-8b
+output_dir: results/model
 per_device_train_batch_size: 4
 report_to:
 - wandb

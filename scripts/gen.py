@@ -107,6 +107,7 @@ def main():
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
+        n=16,
     )
     if stop_token_ids:
         sampling_kwargs["stop_token_ids"] = [int(x) for x in stop_token_ids]
@@ -121,10 +122,12 @@ def main():
 
     results = []
     for i, output in enumerate(outputs):
-        generated_text = output.outputs[0].text.strip()
+        # output.outputs: List[CompletionOutput]，长度应为 n
+        cand_texts = [o.text.strip() for o in output.outputs]
+
         results.append({
             "instruction": eval_dataset[i]["instruction"],
-            "output": generated_text,
+            "outputs": cand_texts,  # <- list[str], length=n
             "generator": args.generator_name,
         })
 
