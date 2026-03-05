@@ -65,7 +65,7 @@ from sp_dpo_trainer import SPDPOTrainer
 TRAINER_REGISTRY = {
     "dpo": DPOTrainer,
     "hypo_dpo": HypoDPOTrainer,
-    "spdpo": SPDPOTrainer,
+    "sp_dpo": SPDPOTrainer,
 }
 
 logger = logging.getLogger(__name__)
@@ -205,9 +205,11 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
         trainer.save_metrics("eval", metrics)
 
     # Save and push to hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    save_dir = os.path.join(training_args.output_dir,trainer_name) 
+    trainer.save_model(save_dir)
+    
+    #if training_args.push_to_hub:
+    #    trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
 
 if __name__ == "__main__":

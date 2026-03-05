@@ -1,5 +1,5 @@
 python scripts/gen.py \
-  --config_yamle eval/alpacaeval/configs/llama3-instruct.yaml \
+  --config_yaml eval/alpacaeval/configs/llama3-instruct.yaml \
   --output_file response/llama3_dpo.json \
-  --model_path \
-  --generator_name
+  --model_path results/model/llama3-8b_dpo \
+  --generator_name llama_dpo

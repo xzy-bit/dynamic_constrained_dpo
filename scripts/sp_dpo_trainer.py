@@ -64,24 +64,24 @@ def _get_batch_ent_score(
     flat_loss = entmax_bisect_loss(flat_logits, flat_labels, alpha, n_iter=50)  # [B*(M-1)]
     token_loss = flat_loss.view(B, M - 1)
 
-    if ispos:
-        if alpha == 1.5:
-            entmax_probs = entmax15(flat_logits, dim=-1)
-        else:
-            entmax_probs = entmax_bisect(flat_logits, alpha=alpha, dim=-1, n_iter=50)
+    #if ispos:
+    #    if alpha == 1.5:
+    #        entmax_probs = entmax15(flat_logits, dim=-1)
+    #    else:
+    #        entmax_probs = entmax_bisect(flat_logits, alpha=alpha, dim=-1, n_iter=50)
 
-        softmax_probs = F.softmax(flat_logits, dim=-1)
+    #    softmax_probs = F.softmax(flat_logits, dim=-1)
 
-        one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
-        tail_mask = (entmax_probs == 0.0) & (~one_hot)
+    #    one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
+    #    tail_mask = (entmax_probs == 0.0) & (~one_hot)
 
-        suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
-        suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
+    #    suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
+    #    suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
 
-        ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M-1)]
-        ns_loss = ns_loss.view(B, M - 1)
+    #    ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M-1)]
+    #    ns_loss = ns_loss.view(B, M - 1)
 
-        token_loss = token_loss + beta * ns_loss - beta * ns_loss.detach()
+    #    token_loss = token_loss + beta * ns_loss - beta * ns_loss.detach()
 
     token_loss = token_loss * mask
     scores = -token_loss.sum(-1)   # [B]
