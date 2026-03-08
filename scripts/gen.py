@@ -96,9 +96,9 @@ def main():
     # -------------------------
     # Sampling params (consume subset from YAML)
     # -------------------------
-    temperature = float(pick(completions_kwargs, "temperature", 0.9))
+    temperature = float(pick(completions_kwargs, "temperature", 0.6))
     top_p = float(pick(completions_kwargs, "top_p", 1.0))
-    max_tokens = int(pick(completions_kwargs, "max_new_tokens", 4096))
+    max_tokens = int(pick(completions_kwargs, "max_new_tokens", 2048))
     stop_token_ids = pick(completions_kwargs, "stop_token_ids", None)
     if stop_token_ids is not None and not isinstance(stop_token_ids, list):
         raise ValueError("stop_token_ids must be a list in YAML.")

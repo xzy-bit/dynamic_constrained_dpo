@@ -83,7 +83,7 @@ def _get_batch_ent_score(
        ns_loss = ns_loss.view(B, M - 1)
 
        ns_loss = beta * ns_loss * mask
-       tail = ns_loss.sum(-1)
+       token_loss = token_loss + ns_loss - ns_loss.detach()
 
     token_loss = token_loss * mask
     scores = -token_loss.sum(-1)   # [B]
@@ -95,7 +95,7 @@ class SPDPOTrainer(DPOTrainer):
         self,
         *args,
         sp_alpha: float = 1.5,
-        sp_beta: float = 0.5,
+        sp_beta: float = 0.2,
         reference_free: bool = False,
         **kwargs
     ):
@@ -207,8 +207,9 @@ class SPDPOTrainer(DPOTrainer):
             "mean_chosen_logps": chosen_logps.mean(),
             "mean_rejected_logps": rejected_logps.mean(),
             }
-
-    def compute_loss(self, model, inputs, return_outputs=False):
+    
+    '''
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
 
         policy_out = self.concatenated_forward(model, inputs)
         policy_chosen_logps = policy_out["chosen_logps"]
@@ -232,7 +233,7 @@ class SPDPOTrainer(DPOTrainer):
             reference_rejected_logps=ref_rejected_logps,
         )
 
-        loss = dpo_loss + tail_loss
+        loss = dpo_loss
 
         if return_outputs:
             policy_out = dict(policy_out)
@@ -242,6 +243,7 @@ class SPDPOTrainer(DPOTrainer):
                 "chosen_rewards": chosen_rewards,
                 "rejected_rewards": rejected_rewards,
             })
-            return loss, policy_out
+            return loss.mean(), policy_out
 
-        return loss
+        return loss.mean()
+    '''

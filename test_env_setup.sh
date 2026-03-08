@@ -115,7 +115,9 @@ echo "Installing requirements (no torch/vllm in this file)..."
 pip install -r "${REQ_FILE}"
 
 pip install vllm
-
+pip install accelerate
+pip install nltk
+pip install sentence_transformers
 echo ""
 echo "Quick import checks..."
 python - <<'PY'

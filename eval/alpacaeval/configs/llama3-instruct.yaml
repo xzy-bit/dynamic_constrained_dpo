@@ -1,7 +1,7 @@
 completions_kwargs:
   batch_size: 900
   do_sample: true
-  max_new_tokens: 4096
+  max_new_tokens: 2048
   model_kwargs:
     torch_dtype: bfloat16
   tokenizer_name_or_path: meta-llama/Meta-Llama-3-8B-Instruct
