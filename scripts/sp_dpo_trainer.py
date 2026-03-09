@@ -65,6 +65,7 @@ def _get_batch_ent_score(
     token_loss = flat_loss.view(B, M - 1)
 
     tail = 0.0
+    '''
     if ispos:
        if alpha == 1.5:
            entmax_probs = entmax15(flat_logits, dim=-1)
@@ -84,6 +85,7 @@ def _get_batch_ent_score(
 
        ns_loss = beta * ns_loss * mask
        token_loss = token_loss + ns_loss - ns_loss.detach()
+    '''
 
     token_loss = token_loss * mask
     scores = -token_loss.sum(-1)   # [B]
@@ -118,7 +120,7 @@ class SPDPOTrainer(DPOTrainer):
         else:
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
-        logits = pi_logratios - ref_logratios
+        logits = pi_logratios - ref_logratios - 1.0
         loss = -F.logsigmoid(self.beta * logits)
 
         chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()

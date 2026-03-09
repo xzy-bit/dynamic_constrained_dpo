@@ -196,8 +196,8 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
     metrics = train_result.metrics
     metrics["train_samples"] = len(dataset)
     trainer.log_metrics("train", metrics)
-    # trainer.save_metrics("train", metrics)
-    # trainer.save_state()
+    trainer.save_metrics("train", metrics)
+    trainer.save_state()
 
     if training_args.eval_strategy != "no":
         metrics = trainer.evaluate()
