@@ -12,7 +12,7 @@ dataset_train_split: train_prefs
 
 # DPOTrainer arguments
 bf16: true
-beta: 0.1
+beta: 0.01
 do_eval: false
 gradient_accumulation_steps: 8
 gradient_checkpointing: true

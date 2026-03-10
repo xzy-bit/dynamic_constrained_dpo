@@ -8,6 +8,30 @@ from trl.trainer.utils import pad_to_length
 
 IGNORE_INDEX = -100
 
+def _get_rejection_penalty(logits, labels, eps=1e-8):
+    B, M, V = logits.shape
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    mask = (shift_labels != IGNORE_INDEX)
+
+    active_logits = shift_logits[mask]   # [num_active, V]
+    active_labels = shift_labels[mask]   # [num_active]
+
+    if active_logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    
+    probs = F.softmax(active_logits,dim=-1)
+    #probs = entmax_bisect(active_logits, alpha=alpha, dim=-1, n_iter=50)  # [num_active, V]
+    p_target = probs.gather(-1, active_labels.unsqueeze(-1)).squeeze(-1)  # [num_active]
+
+    # 计算 -log(1-p)
+    penalty_per_token = -torch.log(1 - p_target + eps)  # [num_active]
+
+    token_penalty = torch.zeros(B, M-1, device=logits.device, dtype=penalty_per_token.dtype)
+    token_penalty[mask] = penalty_per_token
+    seq_penalty = token_penalty.sum(dim=-1)  # [B]
+    return seq_penalty
+
 def _get_batch_ent_score(
     logits: torch.FloatTensor,
     labels: torch.LongTensor,
@@ -35,6 +59,8 @@ def _get_batch_ent_score(
     token_loss = flat_loss.view(B, M - 1)
     
     per_token_logps = []
+    
+    '''
     for row_logits, row_labels in zip(shift_logits, shift_labels, strict=True):
         row_logps = F.log_softmax(row_logits, dim=-1)   # [M-1, V]
         row_per_token_logps = row_logps.gather(
@@ -45,7 +71,8 @@ def _get_batch_ent_score(
 
     per_token_logps = torch.stack(per_token_logps)      # [B, M-1]
     per_token_logps = per_token_logps.masked_fill(~mask, 0.0)
-
+    '''
+    
     '''
     if ispos:
        if alpha == 1.5:
@@ -71,9 +98,9 @@ def _get_batch_ent_score(
     token_loss = token_loss * mask
     scores = -token_loss.sum(-1)   # [B]
     
-    ce_loss = -per_token_logps.sum(-1)
+    #per_token_logps  = per_token_logps.sum(-1)
 
-    return scores, ce_loss
+    return scores, per_token_logps
 
 class SPDPOTrainer(DPOTrainer):
     def __init__(
@@ -88,6 +115,7 @@ class SPDPOTrainer(DPOTrainer):
         self.sp_alpha = sp_alpha
         self.sp_beta = sp_beta
         self.reference_free = reference_free
+        self.rejected_tail = 0.0
 
     def dpo_loss(
         self,
@@ -104,14 +132,14 @@ class SPDPOTrainer(DPOTrainer):
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
 
-        print("=================== Using this =====================")
         logits = pi_logratios - ref_logratios
         loss = -F.logsigmoid(self.beta * logits)
+        #loss = -F.logsigmoid(self.beta * logits) + self.beta * self.rejected_tail
 
         chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()
         rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
-        return loss.mean(), chosen_rewards, rejected_rewards
+        return loss, chosen_rewards, rejected_rewards
 
     def concatenated_inputs(self,batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
         """Concatenate the chosen and rejected inputs into a single tensor.
@@ -137,6 +165,7 @@ class SPDPOTrainer(DPOTrainer):
                     concatenated_batch[concatenated_key],
                     pad_to_length(batch[k], max_length, pad_value=pad_value),
                 ), dim=0)
+        
         return concatenated_batch
 
     def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]):
@@ -145,12 +174,15 @@ class SPDPOTrainer(DPOTrainer):
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
         concatenated_batch = self.concatenated_inputs(batch)
+        all_labels = concatenated_batch['concatenated_input_ids'].clone()
+        all_labels[concatenated_batch['concatenated_attention_mask'] == 0] = -100
+
         all_logits = model(concatenated_batch['concatenated_input_ids'],
                            attention_mask=concatenated_batch['concatenated_attention_mask']).logits
-        chosen_labels = concatenated_batch['concatenated_labels'][:batch['chosen_input_ids'].shape[0]]
-        rejected_labels = concatenated_batch['concatenated_labels'][batch['chosen_input_ids'].shape[0]:]
-
         bsz = batch['chosen_input_ids'].shape[0]
+
+        chosen_labels = all_labels[:bsz]
+        rejected_labels = all_labels[bsz:]
 
         chosen_logits, rejected_logits = all_logits.split(bsz, dim=0)
 
@@ -162,6 +194,9 @@ class SPDPOTrainer(DPOTrainer):
             rejected_logits, rejected_labels,
             alpha=self.sp_alpha, beta=self.sp_beta, ispos=False
         )
+        #self.rejected_tail = _get_rejection_penalty(rejected_logits,rejected_labels)
+        
+
 
         return {
             "chosen_logits": chosen_logits,
@@ -169,14 +204,13 @@ class SPDPOTrainer(DPOTrainer):
             "chosen_labels": chosen_labels,
             "rejected_labels": rejected_labels,
             "chosen_logps": chosen_scores,
-            "rejected_logps": rejected_scores.detach()+rejected_logps - rejected_logps.detach(),
-            # "chosen_scores": chosen_scores,
-            # "rejected_scores": rejected_scores,
+            "rejected_logps": rejected_scores,
             "mean_chosen_logits": chosen_logits.mean(),
             "mean_rejected_logits": rejected_logits.mean(),
 
-            "mean_chosen_logps": chosen_logps.mean(),
-            "mean_rejected_logps": rejected_logps.mean(),
+            # "chosen_scores": chosen_scores,
+            # "rejected_scores": rejected_scores,
+
             }
 
     # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
