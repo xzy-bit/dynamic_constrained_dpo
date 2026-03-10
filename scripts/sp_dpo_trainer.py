@@ -59,8 +59,7 @@ def _get_batch_ent_score(
     token_loss = flat_loss.view(B, M - 1)
     
     per_token_logps = []
-    
-    '''
+
     for row_logits, row_labels in zip(shift_logits, shift_labels, strict=True):
         row_logps = F.log_softmax(row_logits, dim=-1)   # [M-1, V]
         row_per_token_logps = row_logps.gather(
@@ -71,7 +70,6 @@ def _get_batch_ent_score(
 
     per_token_logps = torch.stack(per_token_logps)      # [B, M-1]
     per_token_logps = per_token_logps.masked_fill(~mask, 0.0)
-    '''
     
     '''
     if ispos:
@@ -141,6 +139,7 @@ class SPDPOTrainer(DPOTrainer):
 
         return loss, chosen_rewards, rejected_rewards
 
+    @staticmethod
     def concatenated_inputs(self,batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
         """Concatenate the chosen and rejected inputs into a single tensor.
 
@@ -195,84 +194,84 @@ class SPDPOTrainer(DPOTrainer):
             alpha=self.sp_alpha, beta=self.sp_beta, ispos=False
         )
         #self.rejected_tail = _get_rejection_penalty(rejected_logits,rejected_labels)
-        
-
 
         return {
             "chosen_logits": chosen_logits,
             "rejected_logits": rejected_logits,
             "chosen_labels": chosen_labels,
             "rejected_labels": rejected_labels,
-            "chosen_logps": chosen_scores,
-            "rejected_logps": rejected_scores,
+            "chosen_logps": chosen_logps,
+            "rejected_logps": rejected_logps,
             "mean_chosen_logits": chosen_logits.mean(),
             "mean_rejected_logits": rejected_logits.mean(),
 
-            # "chosen_scores": chosen_scores,
-            # "rejected_scores": rejected_scores,
+            "chosen_scores": chosen_scores,
+            "rejected_scores": rejected_scores,
 
             }
 
-    # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-    #
-    #     policy_out = self.concatenated_forward(model, inputs)
-    #     policy_chosen_logps = policy_out["chosen_logps"]
-    #     policy_rejected_logps = policy_out["rejected_logps"]
-    #     policy_chosen_scores = policy_out["chosen_scores"]
-    #     policy_rejected_scores = policy_out["rejected_scores"]
-    #
-    #
-    #     # reference forward
-    #     if self.reference_free or self.ref_model is None:
-    #         ref_chosen_logps = torch.zeros_like(policy_chosen_logps)
-    #         ref_rejected_logps = torch.zeros_like(policy_rejected_logps)
-    #     else:
-    #         with torch.no_grad():
-    #             ref_out = self.concatenated_forward(self.ref_model, inputs)
-    #         ref_chosen_scores = ref_out["chosen_scores"]
-    #         ref_rejected_scores = ref_out["rejected_scores"]
-    #
-    #     dpo_loss, chosen_rewards, rejected_rewards = self.dpo_loss(
-    #         policy_chosen_logps=policy_chosen_scores,
-    #         policy_rejected_logps=policy_rejected_scores,
-    #         reference_chosen_logps=ref_chosen_scores,
-    #         reference_rejected_logps=ref_rejected_scores,
-    #     )
-    #
-    #     loss = dpo_loss.mean()
-    #
-    #     if self.state.global_step % self.args.logging_steps == 0:
-    #         reward_accuracy = (chosen_rewards > rejected_rewards).float().mean()
-    #
-    #         metrics = {
-    #             "loss_dpo": dpo_loss.mean().detach().float().item(),
-    #             "rewards/chosen": chosen_rewards.mean().detach().float().item(),
-    #             "rewards/rejected": rejected_rewards.mean().detach().float().item(),
-    #             "scores/chosen": policy_chosen_scores.mean().detach().float().item(),
-    #             "scores/rejected": policy_rejected_scores.mean().detach().float().item(),
-    #             "rewards/margins": (chosen_rewards - rejected_rewards).mean().detach().float().item(),
-    #             "rewards/accuracies": reward_accuracy.detach().float().item(),
-    #
-    #             "logits/chosen": policy_out["chosen_logits"].mean().detach().float().item(),
-    #             "logits/rejected": policy_out["rejected_logits"].mean().detach().float().item(),
-    #
-    #             "logps/chosen": -policy_chosen_logps.mean().detach().float().item(),
-    #             "logps/rejected": -policy_rejected_logps.mean().detach().float().item(),
-    #             "logps/margins": (policy_rejected_logps - policy_chosen_logps).mean().detach().float().item(),
-    #             "logps/accuracies": (policy_chosen_logps < policy_rejected_logps).float().mean().item()
-    #         }
-    #
-    #         self.log(metrics)
-    #
-    #
-    #     if return_outputs:
-    #         policy_out = dict(policy_out)
-    #         policy_out.update({
-    #             "loss_dpo": dpo_loss.detach(),
-    #             "chosen_rewards": chosen_rewards,
-    #             "rejected_rewards": rejected_rewards,
-    #         })
-    #         return loss.mean(), policy_out
-    #
-    #     return loss.mean()
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+
+        policy_out = self.concatenated_forward(model, inputs)
+        policy_chosen_logps = policy_out["chosen_logps"]
+        policy_rejected_logps = policy_out["rejected_logps"]
+        policy_chosen_scores = policy_out["chosen_scores"]
+        policy_rejected_scores = policy_out["rejected_scores"]
+
+
+        # reference forward
+        if self.reference_free or self.ref_model is None:
+            ref_chosen_logps = torch.zeros_like(policy_chosen_logps)
+            ref_rejected_logps = torch.zeros_like(policy_rejected_logps)
+        else:
+            with torch.no_grad():
+                ref_out = self.concatenated_forward(self.ref_model, inputs)
+            ref_chosen_logps = ref_out["chosen_logps"]
+            ref_rejected_logps = ref_out["rejected_logps"]
+            ref_chosen_scores = ref_out["chosen_scores"]
+            ref_rejected_scores = ref_out["rejected_scores"]
+
+        dpo_loss, chosen_rewards, rejected_rewards = self.dpo_loss(
+            policy_chosen_logps=policy_chosen_logps,
+            policy_rejected_logps=policy_rejected_logps,
+            reference_chosen_logps=ref_chosen_scores,
+            reference_rejected_logps=ref_rejected_scores,
+        )
+
+        loss = dpo_loss.mean()
+
+        if self.state.global_step % self.args.logging_steps == 0:
+            reward_accuracy = (chosen_rewards > rejected_rewards).float().mean()
+
+            metrics = {
+                "loss_dpo": dpo_loss.mean().detach().float().item(),
+                "rewards/chosen": chosen_rewards.mean().detach().float().item(),
+                "rewards/rejected": rejected_rewards.mean().detach().float().item(),
+                "scores/chosen": policy_chosen_scores.mean().detach().float().item(),
+                "scores/rejected": policy_rejected_scores.mean().detach().float().item(),
+                "rewards/margins": (chosen_rewards - rejected_rewards).mean().detach().float().item(),
+                "rewards/accuracies": reward_accuracy.detach().float().item(),
+
+                "logits/chosen": policy_out["chosen_logits"].mean().detach().float().item(),
+                "logits/rejected": policy_out["rejected_logits"].mean().detach().float().item(),
+
+                "logps/chosen": -policy_chosen_logps.mean().detach().float().item(),
+                "logps/rejected": -policy_rejected_logps.mean().detach().float().item(),
+                "logps/margins": (policy_rejected_logps - policy_chosen_logps).mean().detach().float().item(),
+                "logps/accuracies": (policy_chosen_logps < policy_rejected_logps).float().mean().item()
+            }
+
+            self.log(metrics)
+
+
+        if return_outputs:
+            policy_out = dict(policy_out)
+            policy_out.update({
+                "loss_dpo": dpo_loss.detach(),
+                "chosen_rewards": chosen_rewards,
+                "rejected_rewards": rejected_rewards,
+            })
+            return loss.mean(), policy_out
+
+        return loss.mean()
     
