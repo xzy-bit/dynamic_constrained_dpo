@@ -3,7 +3,8 @@ TRAINER="sp_dpo"
 ACCELERATE_LOG_LEVEL=info accelerate launch \
   --config_file recipes/accelerate_configs/zero3.yaml scripts/run_dpo.py \
   --trainer $TRAINER \
-  --config recipes/llama31-8b/dpo/config.yaml
+  --config recipes/llama31-8b/dpo/config.yaml \
+  2>&1 | tee train.log
 
 
 source /home/llm/miniforge3/etc/profile.d/conda.sh
@@ -11,12 +12,13 @@ conda activate hypo-test
 
 python scripts/gen.py \
   --config_yaml eval/alpacaeval/configs/llama3-instruct.yaml \
-  --output_file "responses/sp_dpo_margin.json" \
-  --model_path results/model/sp_dpo_margin/ \
+  --output_file "responses/sp_dpo.json" \
+  --model_path results/model/sp_dpo/ \
   --generator_name $TRAINER
 
-python eval/score.py --input_json responses/sp_dpo_margin.json
+python eval/score.py --input_json responses/sp_dpo.json
 #python eval/diversity.py --input_json responses/sp_dpo_margin.json
+
 
 <<gen
 python scripts/gen.py \
