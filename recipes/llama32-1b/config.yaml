@@ -1,6 +1,6 @@
 # Model arguments
 #model_name_or_path: results/model/llama3-8b_sft
-model_name_or_path: meta-llama/Llama-3.1-8B-Instruct 
+model_name_or_path: meta-llama/Llama-3.2-1B-Instruct 
 torch_dtype: bfloat16
 
 # Data training arguments
@@ -14,7 +14,7 @@ dataset_train_split: train_prefs
 bf16: true
 beta: 0.01
 do_eval: false
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: False
@@ -29,7 +29,7 @@ optim: adamw_torch
 adam_beta1: 0.9
 adam_beta2: 0.999
 output_dir: results/model
-per_device_train_batch_size: 2
+per_device_train_batch_size: 4
 report_to:
 - wandb
 save_strategy: 'no'
