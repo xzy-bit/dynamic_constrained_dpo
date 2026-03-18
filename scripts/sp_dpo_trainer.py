@@ -147,30 +147,50 @@ def _get_batch_sp_score(
     flat_labels = safe_labels.view(-1)
 
     # token-level entmax loss
-    flat_loss = sparsemax_loss(flat_logits, flat_labels)  # [B*(M-1)]
+    sparse_probs = sparsemax(flat_logits,-1)
+    token_support = (sparse_probs > 0).sum(dim=-1)  # [B*M]
+    token_support = token_support.view(B, M)
+    seq_support_mean = token_support.float().mean(dim=-1)
+
+    z_y = flat_logits.gather(dim=1, index=flat_labels.unsqueeze(1)).squeeze(1)  # [B*M]
+
+    flat_loss = (
+        (sparse_probs * flat_logits).sum(dim=-1)   # <z, p>
+        - 0.5 * sparse_probs.pow(2).sum(dim=-1)    # 0.5 * ||p||^2
+        - z_y
+        + 0.5
+    )
+    '''
+    if not ispos:
+        top1_idx = sparse_probs.argmax(dim=-1)          # [B*M]
+        is_top1_label = (top1_idx == flat_labels)       # [B*M] bool
+
+        coef = torch.where(
+            is_top1_label,
+            torch.full_like(flat_loss, 1.1),
+            torch.ones_like(flat_loss)
+        )
+
+        flat_loss = flat_loss * coef
+        #print("=============== neg sample")
+    '''
     token_loss = flat_loss.view(B, M)
 
-    '''
-    if ispos:
-       if alpha == 1.5:
-           entmax_probs = entmax15(flat_logits, dim=-1)
-       else:
-           entmax_probs = entmax_bisect(flat_logits, alpha=alpha, dim=-1, n_iter=50)
+    
+    softmax_probs = F.softmax(flat_logits, dim=-1)
+    one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
+    tail_mask = (sparse_probs == 0.0) & (~one_hot)
 
-       softmax_probs = F.softmax(flat_logits, dim=-1)
+    suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
+    suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
 
-       one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
-       tail_mask = (entmax_probs == 0.0) & (~one_hot)
+    ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M)]
+    ns_loss = ns_loss.view(B, M)
 
-       suppressed_mass = (softmax_probs * tail_mask.float()).sum(dim=-1)
-       suppressed_mass = torch.clamp(suppressed_mass, max=0.99)
-
-       ns_loss = -torch.log(1.0 - suppressed_mass)              # [B*(M-1)]
-       ns_loss = ns_loss.view(B, M - 1)
-
-       ns_loss = beta * ns_loss * mask
-       token_loss = token_loss + ns_loss - ns_loss.detach()
-    '''
+    ns_loss = 0.01 * ns_loss * mask
+    token_loss = token_loss + ns_loss
+    #print("============== pos sample ==============")
+    
 
     token_loss = token_loss * mask.float()
     
@@ -179,7 +199,7 @@ def _get_batch_sp_score(
 
     per_token_logps = torch.zeros_like(token_loss)
 
-    return -token_loss.sum(-1), per_token_logps.sum(-1)
+    return -token_loss.sum(-1), per_token_logps.sum(-1),seq_support_mean
 
 
 class SPDPOTrainer(DPOTrainer):
@@ -287,24 +307,23 @@ class SPDPOTrainer(DPOTrainer):
         chosen_labels = labels[:num_examples]
         rejected_labels = labels[num_examples:]
         
-        '''
-        chosen_scores, chosen_logps = _get_batch_sp_score(
+        
+        chosen_scores, chosen_logps, chosen_size = _get_batch_sp_score(
             chosen_logits,
             chosen_labels,
             alpha=self.sp_alpha,
             beta=self.sp_beta,
             ispos=True,
         )
-        rejected_scores, rejected_logps = _get_batch_sp_score(
+        rejected_scores, rejected_logps, rejected_size = _get_batch_sp_score(
             rejected_logits,
             rejected_labels,
             alpha=self.sp_alpha,
             beta=self.sp_beta,
             ispos=False,
         )
+        
         '''
-        
-        
         chosen_scores, chosen_logps = _get_batch_ent_score(
             chosen_logits,
             chosen_labels,
@@ -319,7 +338,7 @@ class SPDPOTrainer(DPOTrainer):
             beta=self.sp_beta,
             ispos=False,
         )
-        
+        '''
 
 
         chosen_valid = chosen_labels != -100
@@ -342,6 +361,8 @@ class SPDPOTrainer(DPOTrainer):
             "rejected_logps": rejected_logps,
             "mean_chosen_logits": mean_chosen_logits,
             "mean_rejected_logits": mean_rejected_logits,
+            "chosen_size":chosen_size,
+            "rejected_size":rejected_size
          #   "rejected_penalty": rejected_penalty,
         }
 
@@ -358,7 +379,8 @@ class SPDPOTrainer(DPOTrainer):
         policy_rejected_logps = policy_out["rejected_logps"]
         policy_chosen_scores = policy_out["chosen_scores"]
         policy_rejected_scores = policy_out["rejected_scores"]
-
+        policy_chosen_size = policy_out["chosen_size"]
+        policy_rejected_size = policy_out["rejected_size"]
         if self.reference_free or self.ref_model is None:
             ref_chosen_logps = torch.zeros_like(policy_chosen_scores)
             ref_rejected_logps = torch.zeros_like(policy_rejected_scores)
@@ -396,6 +418,8 @@ class SPDPOTrainer(DPOTrainer):
             "logits/rejected": policy_out["rejected_logits"].mean().detach().cpu(),
             "scores/chosen": policy_chosen_scores.mean().detach().cpu(),
             "scores/rejected": policy_rejected_scores.mean().detach().cpu(),
+            "support_size/chosen": policy_chosen_size.mean().detach().cpu(),
+            "support_size/rejected":policy_rejected_size.mean().detach().cpu()
         }
         self.store_metrics(metrics, train_eval="train")
 

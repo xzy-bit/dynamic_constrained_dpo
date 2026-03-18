@@ -1,4 +1,5 @@
 TRAINER="sp_dpo"
+
 ACCELERATE_LOG_LEVEL=info accelerate launch \
   --config_file recipes/accelerate_configs/zero3.yaml scripts/run_dpo.py \
   --trainer $TRAINER \
@@ -20,11 +21,11 @@ conda activate hypo-test
 
 python scripts/gen.py \
   --config_yaml eval/alpacaeval/configs/llama3-instruct.yaml \
-  --output_file "responses/sp_dpo.json" \
+  --output_file "responses/sp_dpo_ns.json" \
   --model_path results/model/sp_dpo \
   --generator_name $TRAINER
 
-python eval/score.py --input_json responses/sp_dpo.json
+python eval/score.py --input_json responses/sp_dpo_ns.json
 #python eval/diversity.py --input_json responses/sp_dpo_margin.json
 
 
