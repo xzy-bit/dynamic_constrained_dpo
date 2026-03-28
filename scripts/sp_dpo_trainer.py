@@ -4,6 +4,7 @@ from entmax import sparsemax_loss, sparsemax, entmax_bisect_loss,entmax15,entmax
 from trl import DPOTrainer
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 import torch.nn as nn
+from seeking_utils import append_seeking_log, combine_grads, get_last_layer_weight, grad_cosine, grad_norm
 from trl.trainer.utils import pad_to_length
 
 IGNORE_INDEX = -100
@@ -132,6 +133,9 @@ def _get_batch_sp_score(
     labels: torch.LongTensor,
     alpha: float = 1.5,
     beta: float = 0.5,
+    temperature: float = 1.0,
+    average_score: bool = False,
+    neg_support_coef: float = 1.0,
     ispos: bool = False,
 ):
     """
@@ -143,11 +147,11 @@ def _get_batch_sp_score(
     mask = (labels != -100)
     safe_labels = labels.masked_fill(~mask, 0)
 
-    flat_logits = logits.view(-1, V)
-    flat_labels = safe_labels.view(-1)
+    flat_logits = logits.reshape(-1, V)
+    flat_labels = safe_labels.reshape(-1)
 
     # token-level entmax loss
-    sparse_probs = sparsemax(flat_logits,-1)
+    sparse_probs = sparsemax(flat_logits/temperature, -1)
     token_support = (sparse_probs > 0).sum(dim=-1)  # [B*M]
     token_support = token_support.view(B, M)
     seq_support_mean = token_support.float().mean(dim=-1)
@@ -160,23 +164,23 @@ def _get_batch_sp_score(
         - z_y
         + 0.5
     )
-    '''
-    if not ispos:
-        top1_idx = sparse_probs.argmax(dim=-1)          # [B*M]
-        is_top1_label = (top1_idx == flat_labels)       # [B*M] bool
 
-        coef = torch.where(
-            is_top1_label,
-            torch.full_like(flat_loss, 1.1),
-            torch.ones_like(flat_loss)
-        )
+    # if not ispos:
+    #     target_sparse_probs = sparse_probs.gather(dim=1, index=flat_labels.unsqueeze(1)).squeeze(1)
+    #     is_supported_label = target_sparse_probs != 0.0
 
-        flat_loss = flat_loss * coef
-        #print("=============== neg sample")
-    '''
+    #     coef = torch.where(
+    #         is_supported_label,
+    #         torch.full_like(flat_loss, neg_support_coef),
+    #         torch.ones_like(flat_loss)
+    #     )
+
+    #     flat_loss = flat_loss * coef
+    # #     #print("=============== neg sample with supported label")
+    
     token_loss = flat_loss.view(B, M)
 
-    
+    '''
     softmax_probs = F.softmax(flat_logits, dim=-1)
     one_hot = F.one_hot(flat_labels, num_classes=softmax_probs.size(-1)).bool()
     tail_mask = (sparse_probs == 0.0) & (~one_hot)
@@ -190,16 +194,22 @@ def _get_batch_sp_score(
     ns_loss = 0.01 * ns_loss * mask
     token_loss = token_loss + ns_loss
     #print("============== pos sample ==============")
-    
+    '''
+
 
     token_loss = token_loss * mask.float()
     
     #per_token_logps = _get_batch_logps(logits,safe_labels)
     #per_token_logps = per_token_logps * mask
 
-    per_token_logps = torch.zeros_like(token_loss)
+    per_token_logps = F.log_softmax(logits, dim=-1).gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    per_token_logps = per_token_logps * mask.float()
+    lengths = mask.sum(-1).clamp_min(1)
+    seq_scores = -token_loss.sum(-1)
+    if average_score:
+        seq_scores = seq_scores / lengths
 
-    return -token_loss.sum(-1), per_token_logps.sum(-1),seq_support_mean
+    return seq_scores, per_token_logps.sum(-1), seq_support_mean
 
 
 class SPDPOTrainer(DPOTrainer):
@@ -208,6 +218,8 @@ class SPDPOTrainer(DPOTrainer):
         *args,
         sp_alpha: float = 1.5,
         sp_beta: float = 0.2,
+        sp_temperature: float = 2.0,
+        sp_neg_support_coef: float = 1.1,
         reference_free: bool = False,
         **kwargs
     ):
@@ -215,6 +227,8 @@ class SPDPOTrainer(DPOTrainer):
         self.model_accepts_loss_kwargs = False
         self.sp_alpha = sp_alpha
         self.sp_beta = sp_beta
+        self.sp_temperature = sp_temperature
+        self.sp_neg_support_coef = sp_neg_support_coef
         self.reference_free = reference_free
 
     def dpo_loss(
@@ -231,8 +245,6 @@ class SPDPOTrainer(DPOTrainer):
         else:
             ref_logratios = reference_chosen_logps - reference_rejected_logps
 
-        #ref_logratios = torch.clamp(ref_logratios, min=0.0)
-
         logits = pi_logratios - ref_logratios
         loss = -F.logsigmoid(self.beta * logits)
         #loss = -F.logsigmoid(self.beta * logits) + self.beta * self.rejected_tail
@@ -245,6 +257,14 @@ class SPDPOTrainer(DPOTrainer):
     def store_metrics(self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        train_eval = "train" if "loss" in logs else "eval"
+        for key, metrics in self._stored_metrics[train_eval].items():
+            logs[key] = torch.tensor(metrics).mean().item()
+        del self._stored_metrics[train_eval]
+        append_seeking_log("sp_dpo", logs)
+        return super().log(logs, start_time)
     
     def concatenated_forward(self, model, batch):
         num_examples = batch["prompt_input_ids"].shape[0]
@@ -313,6 +333,8 @@ class SPDPOTrainer(DPOTrainer):
             chosen_labels,
             alpha=self.sp_alpha,
             beta=self.sp_beta,
+            temperature=self.sp_temperature,
+            neg_support_coef=self.sp_neg_support_coef,
             ispos=True,
         )
         rejected_scores, rejected_logps, rejected_size = _get_batch_sp_score(
@@ -320,6 +342,8 @@ class SPDPOTrainer(DPOTrainer):
             rejected_labels,
             alpha=self.sp_alpha,
             beta=self.sp_beta,
+            temperature=self.sp_temperature,
+            neg_support_coef=self.sp_neg_support_coef,
             ispos=False,
         )
         
@@ -382,13 +406,11 @@ class SPDPOTrainer(DPOTrainer):
         policy_chosen_size = policy_out["chosen_size"]
         policy_rejected_size = policy_out["rejected_size"]
         if self.reference_free or self.ref_model is None:
-            ref_chosen_logps = torch.zeros_like(policy_chosen_scores)
-            ref_rejected_logps = torch.zeros_like(policy_rejected_scores)
+            ref_chosen_scores = torch.zeros_like(policy_chosen_scores)
+            ref_rejected_scores = torch.zeros_like(policy_rejected_scores)
         else:
             with torch.no_grad():
                 ref_out = self.concatenated_forward(self.ref_model, inputs)
-            ref_chosen_logps = ref_out["chosen_logps"]
-            ref_rejected_logps = ref_out["rejected_logps"]
             ref_chosen_scores = ref_out["chosen_scores"]
             ref_rejected_scores = ref_out["rejected_scores"]
         
@@ -407,19 +429,76 @@ class SPDPOTrainer(DPOTrainer):
         loss = dpo_loss
         #loss = dpo_loss + self.beta * 0.1 * rejected_penalty 
 
+        chosen_score = policy_chosen_scores - ref_chosen_scores
+        rejected_score = policy_rejected_scores - ref_rejected_scores
+        raw_margin = (policy_chosen_scores - policy_rejected_scores) - (ref_chosen_scores - ref_rejected_scores)
+        objective_margin = self.beta * raw_margin
+        sigmoid_margin = torch.sigmoid(objective_margin)
+        objective_accuracy = (chosen_score > rejected_score).float()
+        last_layer_weight = get_last_layer_weight(model)
+        chosen_only_loss, _, _ = self.dpo_loss(
+            policy_chosen_logps=policy_chosen_scores,
+            policy_rejected_logps=policy_rejected_scores.detach(),
+            reference_chosen_logps=ref_chosen_scores,
+            reference_rejected_logps=ref_rejected_scores,
+        )
+        rejected_only_loss, _, _ = self.dpo_loss(
+            policy_chosen_logps=policy_chosen_scores.detach(),
+            policy_rejected_logps=policy_rejected_scores,
+            reference_chosen_logps=ref_chosen_scores,
+            reference_rejected_logps=ref_rejected_scores,
+        )
+        chosen_param_grad = torch.autograd.grad(
+            chosen_only_loss.mean(), last_layer_weight, retain_graph=True, allow_unused=True
+        )[0]
+        rejected_param_grad = torch.autograd.grad(
+            rejected_only_loss.mean(), last_layer_weight, retain_graph=True, allow_unused=True
+        )[0]
+        total_param_grad = combine_grads(chosen_param_grad, rejected_param_grad)
+        full_param_grad = torch.autograd.grad(loss.mean(), last_layer_weight, retain_graph=True, allow_unused=True)[0]
+        chosen_total_cos = grad_cosine(chosen_param_grad, full_param_grad)
+        rejected_total_cos = grad_cosine(rejected_param_grad, full_param_grad)
+        chosen_rejected_cos = grad_cosine(chosen_param_grad, rejected_param_grad)
+        combined_total_cos = grad_cosine(total_param_grad, full_param_grad)
+        chosen_grad_norm = grad_norm(chosen_param_grad)
+        rejected_grad_norm = grad_norm(rejected_param_grad)
+        chosen_rejected_grad_norm_ratio = chosen_grad_norm / rejected_grad_norm.clamp_min(1e-12)
+        residual_grad = None
+        if total_param_grad is not None and full_param_grad is not None:
+            residual_grad = total_param_grad - full_param_grad
+        elif total_param_grad is not None:
+            residual_grad = total_param_grad
+        elif full_param_grad is not None:
+            residual_grad = -full_param_grad
+        decomposition_residual = grad_norm(residual_grad)
         metrics = {
-            "rewards/chosen": chosen_rewards.mean().detach().cpu(),
-            "rewards/rejected": rejected_rewards.mean().detach().cpu(),
-            "rewards/accuracies": (chosen_rewards > rejected_rewards).float().mean().detach().cpu(),
-            "rewards/margins": (chosen_rewards - rejected_rewards).mean().detach().cpu(),
-            "logps/chosen": policy_chosen_logps.mean().detach().cpu(),
-            "logps/rejected": policy_rejected_logps.mean().detach().cpu(),
-            "logits/chosen": policy_out["chosen_logits"].mean().detach().cpu(),
-            "logits/rejected": policy_out["rejected_logits"].mean().detach().cpu(),
-            "scores/chosen": policy_chosen_scores.mean().detach().cpu(),
-            "scores/rejected": policy_rejected_scores.mean().detach().cpu(),
-            "support_size/chosen": policy_chosen_size.mean().detach().cpu(),
-            "support_size/rejected":policy_rejected_size.mean().detach().cpu()
+            "seeking/rewards/chosen": chosen_rewards.mean().detach().cpu(),
+            "seeking/rewards/rejected": rejected_rewards.mean().detach().cpu(),
+            # "seeking/rewards/accuracies": (chosen_rewards > rejected_rewards).float().mean().detach().cpu(),
+            "seeking/rewards/margins": (chosen_rewards - rejected_rewards).mean().detach().cpu(),
+            "seeking/scores/chosen": chosen_score.mean().detach().cpu(),
+            "seeking/scores/rejected": rejected_score.mean().detach().cpu(),
+            "seeking/scores/accuracies": objective_accuracy.mean().detach().cpu(),
+            "seeking/scores/raw_margins": raw_margin.mean().detach().cpu(),
+            "seeking/scores/objective_margins": objective_margin.mean().detach().cpu(),
+            "seeking/scores/sigmoid_margins": sigmoid_margin.mean().detach().cpu(),
+            "seeking/grads/chosen_grad_norm": chosen_grad_norm.detach().cpu(),
+            "seeking/grads/rejected_grad_norm": rejected_grad_norm.detach().cpu(),
+            "seeking/grads/chosen_rejected_grad_norm_ratio": chosen_rejected_grad_norm_ratio.detach().cpu(),
+            "seeking/grads/chosen_loss_grad_total_cosine": chosen_total_cos.detach().cpu(),
+            "seeking/grads/rejected_loss_grad_total_cosine": rejected_total_cos.detach().cpu(),
+            "seeking/grads/chosen_rejected_grad_cosine": chosen_rejected_cos.detach().cpu(),
+            "seeking/grads/combined_loss_grad_total_cosine": combined_total_cos.detach().cpu(),
+            "seeking/grads/total_grad_norm": grad_norm(full_param_grad).detach().cpu(),
+            "seeking/grads/decomposition_residual_norm": decomposition_residual.detach().cpu(),
+            "seeking/logps/chosen": policy_chosen_logps.mean().detach().cpu(),
+            "seeking/logps/rejected": policy_rejected_logps.mean().detach().cpu(),
+            "seeking/logits/chosen": policy_out["chosen_logits"].mean().detach().cpu(),
+            "seeking/logits/rejected": policy_out["rejected_logits"].mean().detach().cpu(),
+            "seeking/fy_scores/chosen": policy_chosen_scores.mean().detach().cpu(),
+            "seeking/fy_scores/rejected": policy_rejected_scores.mean().detach().cpu(),
+            "seeking/support_size/chosen": policy_chosen_size.mean().detach().cpu(),
+            "seeking/support_size/rejected":policy_rejected_size.mean().detach().cpu()
         }
         self.store_metrics(metrics, train_eval="train")
 

@@ -1,0 +1,39 @@
+# Model arguments
+model_name_or_path: meta-llama/Llama-3.2-1B-Instruct
+torch_dtype: bfloat16
+
+# Data training arguments
+dataset_name: HuggingFaceH4/ultrafeedback_binarized
+dataset_config: default
+dataset_train_split: train_prefs
+
+# SP-SimPO arguments
+bf16: true
+beta: 2.5
+gamma_beta_ratio: 0.55
+sp_alpha: 1.5
+sp_beta: 0.2
+sp_temperature: 2.0
+sp_neg_support_coef: 1.05
+do_eval: false
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: False
+learning_rate: 1.0e-6
+log_level: info
+logging_steps: 2
+lr_scheduler_type: cosine
+max_length: 2048
+max_prompt_length: 1800
+num_train_epochs: 1
+optim: adamw_torch
+adam_beta1: 0.9
+adam_beta2: 0.999
+output_dir: results/model/sp_simpo_llama32_1b
+per_device_train_batch_size: 4
+report_to:
+- wandb
+save_strategy: 'no'
+seed: 42
+warmup_ratio: 0.1

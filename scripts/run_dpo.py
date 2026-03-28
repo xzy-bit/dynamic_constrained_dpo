@@ -59,13 +59,24 @@ from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import DPOConfig, ScriptArguments, get_dataset, get_model, get_tokenizer
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
+from dpo_metrics_trainer import DPOMetricsTrainer
 from hypo_dpo_trainer import HypoDPOTrainer
+from simpo_config import SimPOConfig
+from simpo_trainer import SimPOTrainer
+from sp_dpo_config import SPDPOConfig
 from sp_dpo_trainer import SPDPOTrainer
+from sp_hypo_config import SPHypoConfig
+from sp_hypo_trainer import SPHypoTrainer
+from sp_simpo_config import SPSimPOConfig
+from sp_simpo_trainer import SPSimPOTrainer
 
 TRAINER_REGISTRY = {
-    "dpo": DPOTrainer,
+    "dpo": DPOMetricsTrainer,
     "hypo_dpo": HypoDPOTrainer,
     "sp_dpo": SPDPOTrainer,
+    "sp_hypo": SPHypoTrainer,
+    "sp_simpo": SPSimPOTrainer,
+    "simpo": SimPOTrainer,
 }
 
 logger = logging.getLogger(__name__)
@@ -145,8 +156,11 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
     ###################
     # Model & Tokenizer
     ###################
+    if trainer_name in {"simpo", "sp_simpo"}:
+        training_args.truncation_side = "left"
     model = get_model(model_args, training_args)
-    ref_model = get_model(model_args, training_args)
+    use_reference_model = trainer_name not in {"simpo", "sp_simpo"}
+    ref_model = get_model(model_args, training_args) if use_reference_model else None
     tokenizer = get_tokenizer(model_args, training_args)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -177,14 +191,64 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
     #    return tokenizer.apply_chat_template(example["messages"], tokenize=False)
     TrainerCls = TRAINER_REGISTRY[trainer_name]
 
-    trainer = TrainerCls(
-        model,
-        ref_model,
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        peft_config=get_peft_config(model_args),
-    )
+    if trainer_name == "simpo":
+        trainer = TrainerCls(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            tokenizer=tokenizer,
+            peft_config=get_peft_config(model_args),
+        )
+    elif trainer_name == "sp_simpo":
+        trainer = TrainerCls(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            tokenizer=tokenizer,
+            peft_config=get_peft_config(model_args),
+            sp_alpha=training_args.sp_alpha,
+            sp_beta=training_args.sp_beta,
+            sp_temperature=training_args.sp_temperature,
+            sp_neg_support_coef=training_args.sp_neg_support_coef,
+        )
+    elif trainer_name == "sp_dpo":
+        trainer = TrainerCls(
+            model,
+            ref_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            sp_alpha=training_args.sp_alpha,
+            sp_beta=training_args.sp_beta,
+            sp_temperature=training_args.sp_temperature,
+            sp_neg_support_coef=training_args.sp_neg_support_coef,
+            reference_free=training_args.reference_free,
+        )
+    elif trainer_name == "sp_hypo":
+        trainer = TrainerCls(
+            model,
+            ref_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            sp_alpha=training_args.sp_alpha,
+            sp_beta=training_args.sp_beta,
+            sp_temperature=training_args.sp_temperature,
+            sp_neg_support_coef=training_args.sp_neg_support_coef,
+            sp_margin=training_args.sp_margin,
+            reference_free=training_args.reference_free,
+        )
+    else:
+        trainer = TrainerCls(
+            model,
+            ref_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+        )
 
     logger.info("*** Train ***")
     checkpoint = None
@@ -228,7 +292,17 @@ if __name__ == "__main__":
     _old_argv = sys.argv
     sys.argv = [sys.argv[0]] + remaining_argv
     try:
-        parser = TrlParser((ScriptArguments, DPOConfig, ModelConfig))
+        if pre_args.trainer == "simpo":
+            config_cls = SimPOConfig
+        elif pre_args.trainer == "sp_simpo":
+            config_cls = SPSimPOConfig
+        elif pre_args.trainer == "sp_hypo":
+            config_cls = SPHypoConfig
+        elif pre_args.trainer == "sp_dpo":
+            config_cls = SPDPOConfig
+        else:
+            config_cls = DPOConfig
+        parser = TrlParser((ScriptArguments, config_cls, ModelConfig))
         script_args, training_args, model_args = parser.parse_args_and_config()
     finally:
         sys.argv = _old_argv
