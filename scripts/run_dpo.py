@@ -65,8 +65,6 @@ from simpo_config import SimPOConfig
 from simpo_trainer import SimPOTrainer
 from sp_dpo_config import SPDPOConfig
 from sp_dpo_trainer import SPDPOTrainer
-from sp_hypo_config import SPHypoConfig
-from sp_hypo_trainer import SPHypoTrainer
 from sp_simpo_config import SPSimPOConfig
 from sp_simpo_trainer import SPSimPOTrainer
 
@@ -74,7 +72,7 @@ TRAINER_REGISTRY = {
     "dpo": DPOMetricsTrainer,
     "hypo_dpo": HypoDPOTrainer,
     "sp_dpo": SPDPOTrainer,
-    "sp_hypo": SPHypoTrainer,
+    # "sp_hypo": SPHypoTrainer,  # Disabled: local repo does not include sp_hypo implementation/config.
     "sp_simpo": SPSimPOTrainer,
     "simpo": SimPOTrainer,
 }
@@ -225,21 +223,6 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
             sp_neg_support_coef=training_args.sp_neg_support_coef,
             reference_free=training_args.reference_free,
         )
-    elif trainer_name == "sp_hypo":
-        trainer = TrainerCls(
-            model,
-            ref_model,
-            args=training_args,
-            train_dataset=dataset,
-            processing_class=tokenizer,
-            peft_config=get_peft_config(model_args),
-            sp_alpha=training_args.sp_alpha,
-            sp_beta=training_args.sp_beta,
-            sp_temperature=training_args.sp_temperature,
-            sp_neg_support_coef=training_args.sp_neg_support_coef,
-            sp_margin=training_args.sp_margin,
-            reference_free=training_args.reference_free,
-        )
     else:
         trainer = TrainerCls(
             model,
@@ -296,8 +279,6 @@ if __name__ == "__main__":
             config_cls = SimPOConfig
         elif pre_args.trainer == "sp_simpo":
             config_cls = SPSimPOConfig
-        elif pre_args.trainer == "sp_hypo":
-            config_cls = SPHypoConfig
         elif pre_args.trainer == "sp_dpo":
             config_cls = SPDPOConfig
         else:

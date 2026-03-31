@@ -1,4 +1,5 @@
 import inspect
+import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
@@ -113,6 +114,9 @@ class SimPOTrainer(Trainer):
         self.max_length = args.max_length if args.max_length is not None else 512
         self.max_prompt_length = args.max_prompt_length if args.max_prompt_length is not None else 128
         self.max_target_length = args.max_target_length if args.max_target_length is not None else 128
+        self.enable_grad_metrics = os.environ.get("SIMPO_ENABLE_GRAD_METRICS", "1") != "0"
+        self.grad_metrics_interval = max(int(os.environ.get("SIMPO_GRAD_METRICS_INTERVAL", "5")), 1)
+        self._last_grad_metrics_step = -1
 
         if data_collator is None:
             data_collator = DPODataCollatorWithPadding(
@@ -447,32 +451,6 @@ class SimPOTrainer(Trainer):
         objective_margin = self.beta * (raw_margin - self.gamma_beta_ratio)
         sigmoid_margin = torch.sigmoid(objective_margin)
         objective_accuracy = (policy_chosen_logps > policy_rejected_logps).float()
-        last_layer_weight = get_last_layer_weight(model)
-        chosen_only_losses, _, _ = self.simpo_loss(policy_chosen_logps, policy_rejected_logps.detach())
-        rejected_only_losses, _, _ = self.simpo_loss(policy_chosen_logps.detach(), policy_rejected_logps)
-        chosen_param_grad = torch.autograd.grad(
-            chosen_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
-        )[0]
-        rejected_param_grad = torch.autograd.grad(
-            rejected_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
-        )[0]
-        total_param_grad = combine_grads(chosen_param_grad, rejected_param_grad)
-        full_param_grad = torch.autograd.grad(loss, last_layer_weight, retain_graph=True, allow_unused=True)[0]
-        chosen_total_cos = grad_cosine(chosen_param_grad, full_param_grad)
-        rejected_total_cos = grad_cosine(rejected_param_grad, full_param_grad)
-        chosen_rejected_cos = grad_cosine(chosen_param_grad, rejected_param_grad)
-        combined_total_cos = grad_cosine(total_param_grad, full_param_grad)
-        chosen_grad_norm = grad_norm(chosen_param_grad)
-        rejected_grad_norm = grad_norm(rejected_param_grad)
-        chosen_rejected_grad_norm_ratio = chosen_grad_norm / rejected_grad_norm.clamp_min(1e-12)
-        residual_grad = None
-        if total_param_grad is not None and full_param_grad is not None:
-            residual_grad = total_param_grad - full_param_grad
-        elif total_param_grad is not None:
-            residual_grad = total_param_grad
-        elif full_param_grad is not None:
-            residual_grad = -full_param_grad
-        decomposition_residual = grad_norm(residual_grad)
         metrics = {
             f"{prefix}rewards/chosen": chosen_rewards.mean().cpu(),
             f"{prefix}rewards/rejected": rejected_rewards.mean().cpu(),
@@ -484,15 +462,6 @@ class SimPOTrainer(Trainer):
             f"{prefix}scores/raw_margins": raw_margin.detach().mean().cpu(),
             f"{prefix}scores/objective_margins": objective_margin.detach().mean().cpu(),
             f"{prefix}scores/sigmoid_margins": sigmoid_margin.detach().mean().cpu(),
-            f"{prefix}grads/chosen_grad_norm": chosen_grad_norm.detach().cpu(),
-            f"{prefix}grads/rejected_grad_norm": rejected_grad_norm.detach().cpu(),
-            f"{prefix}grads/chosen_rejected_grad_norm_ratio": chosen_rejected_grad_norm_ratio.detach().cpu(),
-            f"{prefix}grads/chosen_loss_grad_total_cosine": chosen_total_cos.detach().cpu(),
-            f"{prefix}grads/rejected_loss_grad_total_cosine": rejected_total_cos.detach().cpu(),
-            f"{prefix}grads/chosen_rejected_grad_cosine": chosen_rejected_cos.detach().cpu(),
-            f"{prefix}grads/combined_loss_grad_total_cosine": combined_total_cos.detach().cpu(),
-            f"{prefix}grads/total_grad_norm": grad_norm(full_param_grad).detach().cpu(),
-            f"{prefix}grads/decomposition_residual_norm": decomposition_residual.detach().cpu(),
             f"{prefix}logps/rejected": self.get_batch_logps(
                 policy_rejected_logits,
                 rejected_labels,
@@ -510,6 +479,99 @@ class SimPOTrainer(Trainer):
             f"{prefix}logits/rejected": policy_rejected_logits.detach().mean().cpu(),
             f"{prefix}logits/chosen": policy_chosen_logits.detach().mean().cpu(),
         }
+
+        should_compute_grad_metrics = self.enable_grad_metrics
+        if should_compute_grad_metrics and train_eval == "train":
+            current_step = self.state.global_step + 1
+            should_compute_grad_metrics = (
+                current_step % self.grad_metrics_interval == 0 and current_step != self._last_grad_metrics_step
+            )
+            if should_compute_grad_metrics:
+                self._last_grad_metrics_step = current_step
+
+        if should_compute_grad_metrics:
+            was_training = model.training
+            model.eval()
+            try:
+                last_layer_weight = get_last_layer_weight(model)
+
+                # Use fresh forward graphs for the grad diagnostics. Reusing the same
+                # graph for multiple autograd.grad calls can break on some distributed
+                # runs with long-sequence batches.
+                def _fresh_policy_outputs():
+                    return self.concatenated_forward(model, batch)
+
+                (
+                    fresh_chosen_logps,
+                    fresh_rejected_logps,
+                    _fresh_chosen_logits,
+                    _fresh_rejected_logits,
+                    _fresh_chosen_labels,
+                    _fresh_rejected_labels,
+                ) = _fresh_policy_outputs()
+                chosen_only_losses, _, _ = self.simpo_loss(fresh_chosen_logps, fresh_rejected_logps.detach())
+                chosen_param_grad = torch.autograd.grad(
+                    chosen_only_losses.mean(), last_layer_weight, retain_graph=False, allow_unused=True
+                )[0]
+
+                (
+                    fresh_chosen_logps,
+                    fresh_rejected_logps,
+                    _fresh_chosen_logits,
+                    _fresh_rejected_logits,
+                    _fresh_chosen_labels,
+                    _fresh_rejected_labels,
+                ) = _fresh_policy_outputs()
+                rejected_only_losses, _, _ = self.simpo_loss(fresh_chosen_logps.detach(), fresh_rejected_logps)
+                rejected_param_grad = torch.autograd.grad(
+                    rejected_only_losses.mean(), last_layer_weight, retain_graph=False, allow_unused=True
+                )[0]
+                total_param_grad = combine_grads(chosen_param_grad, rejected_param_grad)
+
+                (
+                    fresh_chosen_logps,
+                    fresh_rejected_logps,
+                    _fresh_chosen_logits,
+                    _fresh_rejected_logits,
+                    _fresh_chosen_labels,
+                    _fresh_rejected_labels,
+                ) = _fresh_policy_outputs()
+                full_losses, _, _ = self.simpo_loss(fresh_chosen_logps, fresh_rejected_logps)
+                full_param_grad = torch.autograd.grad(
+                    full_losses.mean(), last_layer_weight, retain_graph=False, allow_unused=True
+                )[0]
+                chosen_total_cos = grad_cosine(chosen_param_grad, full_param_grad)
+                rejected_total_cos = grad_cosine(rejected_param_grad, full_param_grad)
+                chosen_rejected_cos = grad_cosine(chosen_param_grad, rejected_param_grad)
+                combined_total_cos = grad_cosine(total_param_grad, full_param_grad)
+                chosen_grad_norm = grad_norm(chosen_param_grad)
+                rejected_grad_norm = grad_norm(rejected_param_grad)
+                chosen_rejected_grad_norm_ratio = chosen_grad_norm / rejected_grad_norm.clamp_min(1e-12)
+                residual_grad = None
+                if total_param_grad is not None and full_param_grad is not None:
+                    residual_grad = total_param_grad - full_param_grad
+                elif total_param_grad is not None:
+                    residual_grad = total_param_grad
+                elif full_param_grad is not None:
+                    residual_grad = -full_param_grad
+                decomposition_residual = grad_norm(residual_grad)
+
+                metrics.update(
+                    {
+                        f"{prefix}grads/chosen_grad_norm": chosen_grad_norm.detach().cpu(),
+                        f"{prefix}grads/rejected_grad_norm": rejected_grad_norm.detach().cpu(),
+                        f"{prefix}grads/chosen_rejected_grad_norm_ratio": chosen_rejected_grad_norm_ratio.detach().cpu(),
+                        f"{prefix}grads/chosen_loss_grad_total_cosine": chosen_total_cos.detach().cpu(),
+                        f"{prefix}grads/rejected_loss_grad_total_cosine": rejected_total_cos.detach().cpu(),
+                        f"{prefix}grads/chosen_rejected_grad_cosine": chosen_rejected_cos.detach().cpu(),
+                        f"{prefix}grads/combined_loss_grad_total_cosine": combined_total_cos.detach().cpu(),
+                        f"{prefix}grads/total_grad_norm": grad_norm(full_param_grad).detach().cpu(),
+                        f"{prefix}grads/decomposition_residual_norm": decomposition_residual.detach().cpu(),
+                    }
+                )
+            finally:
+                if was_training:
+                    model.train()
 
         if self.sft_weight > 0.0:
             if not self.is_encoder_decoder:

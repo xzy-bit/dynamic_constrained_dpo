@@ -1,3 +1,4 @@
+import os
 from typing import Any, Literal, Union
 
 import torch
@@ -10,6 +11,12 @@ from seeking_utils import append_seeking_log, combine_grads, get_last_layer_weig
 
 
 class DPOMetricsTrainer(DPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enable_grad_metrics = os.environ.get("DPO_ENABLE_GRAD_METRICS", "1") != "0"
+        self.grad_metrics_interval = max(int(os.environ.get("DPO_GRAD_METRICS_INTERVAL", "5")), 1)
+        self._last_grad_metrics_step = -1
+
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         num_examples = batch["prompt_input_ids"].shape[0]
 
@@ -176,42 +183,6 @@ class DPOMetricsTrainer(DPOTrainer):
         objective_margin = self.beta * raw_margin
         sigmoid_margin = torch.sigmoid(objective_margin)
         objective_accuracy = (chosen_score > rejected_score).float()
-        last_layer_weight = get_last_layer_weight(model)
-        chosen_only_losses, _, _ = self.dpo_loss(
-            model_output["chosen_logps"],
-            model_output["rejected_logps"].detach(),
-            ref_chosen_logps,
-            ref_rejected_logps,
-        )
-        rejected_only_losses, _, _ = self.dpo_loss(
-            model_output["chosen_logps"].detach(),
-            model_output["rejected_logps"],
-            ref_chosen_logps,
-            ref_rejected_logps,
-        )
-        chosen_param_grad = torch.autograd.grad(
-            chosen_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
-        )[0]
-        rejected_param_grad = torch.autograd.grad(
-            rejected_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
-        )[0]
-        total_param_grad = combine_grads(chosen_param_grad, rejected_param_grad)
-        full_param_grad = torch.autograd.grad(loss, last_layer_weight, retain_graph=True, allow_unused=True)[0]
-        chosen_total_cos = grad_cosine(chosen_param_grad, full_param_grad)
-        rejected_total_cos = grad_cosine(rejected_param_grad, full_param_grad)
-        chosen_rejected_cos = grad_cosine(chosen_param_grad, rejected_param_grad)
-        combined_total_cos = grad_cosine(total_param_grad, full_param_grad)
-        chosen_grad_norm = grad_norm(chosen_param_grad)
-        rejected_grad_norm = grad_norm(rejected_param_grad)
-        chosen_rejected_grad_norm_ratio = chosen_grad_norm / rejected_grad_norm.clamp_min(1e-12)
-        residual_grad = None
-        if total_param_grad is not None and full_param_grad is not None:
-            residual_grad = total_param_grad - full_param_grad
-        elif total_param_grad is not None:
-            residual_grad = total_param_grad
-        elif full_param_grad is not None:
-            residual_grad = -full_param_grad
-        decomposition_residual = grad_norm(residual_grad)
         remapped_metrics = {}
         for key, value in metrics.items():
             if key.startswith("eval_"):
@@ -237,33 +208,84 @@ class DPOMetricsTrainer(DPOTrainer):
         metrics[f"{prefix}scores/sigmoid_margins"] = (
             self.accelerator.gather_for_metrics(sigmoid_margin).detach().mean().item()
         )
-        metrics[f"{prefix}grads/chosen_grad_norm"] = (
-            self.accelerator.gather_for_metrics(chosen_grad_norm).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/rejected_grad_norm"] = (
-            self.accelerator.gather_for_metrics(rejected_grad_norm).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/chosen_rejected_grad_norm_ratio"] = (
-            self.accelerator.gather_for_metrics(chosen_rejected_grad_norm_ratio).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/chosen_loss_grad_total_cosine"] = (
-            self.accelerator.gather_for_metrics(chosen_total_cos).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/rejected_loss_grad_total_cosine"] = (
-            self.accelerator.gather_for_metrics(rejected_total_cos).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/chosen_rejected_grad_cosine"] = (
-            self.accelerator.gather_for_metrics(chosen_rejected_cos).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/combined_loss_grad_total_cosine"] = (
-            self.accelerator.gather_for_metrics(combined_total_cos).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/total_grad_norm"] = (
-            self.accelerator.gather_for_metrics(grad_norm(full_param_grad)).detach().mean().item()
-        )
-        metrics[f"{prefix}grads/decomposition_residual_norm"] = (
-            self.accelerator.gather_for_metrics(decomposition_residual).detach().mean().item()
-        )
+        should_compute_grad_metrics = self.enable_grad_metrics
+        if should_compute_grad_metrics and train_eval == "train":
+            current_step = self.state.global_step + 1
+            should_compute_grad_metrics = (
+                current_step % self.grad_metrics_interval == 0 and current_step != self._last_grad_metrics_step
+            )
+            if should_compute_grad_metrics:
+                self._last_grad_metrics_step = current_step
+        if should_compute_grad_metrics:
+            was_training = model.training
+            model.eval()
+            try:
+                last_layer_weight = get_last_layer_weight(model)
+                chosen_only_losses, _, _ = self.dpo_loss(
+                    model_output["chosen_logps"],
+                    model_output["rejected_logps"].detach(),
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                )
+                rejected_only_losses, _, _ = self.dpo_loss(
+                    model_output["chosen_logps"].detach(),
+                    model_output["rejected_logps"],
+                    ref_chosen_logps,
+                    ref_rejected_logps,
+                )
+                chosen_param_grad = torch.autograd.grad(
+                    chosen_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
+                )[0]
+                rejected_param_grad = torch.autograd.grad(
+                    rejected_only_losses.mean(), last_layer_weight, retain_graph=True, allow_unused=True
+                )[0]
+                total_param_grad = combine_grads(chosen_param_grad, rejected_param_grad)
+                full_param_grad = torch.autograd.grad(loss, last_layer_weight, retain_graph=True, allow_unused=True)[0]
+                chosen_total_cos = grad_cosine(chosen_param_grad, full_param_grad)
+                rejected_total_cos = grad_cosine(rejected_param_grad, full_param_grad)
+                chosen_rejected_cos = grad_cosine(chosen_param_grad, rejected_param_grad)
+                combined_total_cos = grad_cosine(total_param_grad, full_param_grad)
+                chosen_grad_norm = grad_norm(chosen_param_grad)
+                rejected_grad_norm = grad_norm(rejected_param_grad)
+                chosen_rejected_grad_norm_ratio = chosen_grad_norm / rejected_grad_norm.clamp_min(1e-12)
+                residual_grad = None
+                if total_param_grad is not None and full_param_grad is not None:
+                    residual_grad = total_param_grad - full_param_grad
+                elif total_param_grad is not None:
+                    residual_grad = total_param_grad
+                elif full_param_grad is not None:
+                    residual_grad = -full_param_grad
+                decomposition_residual = grad_norm(residual_grad)
+                metrics[f"{prefix}grads/chosen_grad_norm"] = (
+                    self.accelerator.gather_for_metrics(chosen_grad_norm).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/rejected_grad_norm"] = (
+                    self.accelerator.gather_for_metrics(rejected_grad_norm).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/chosen_rejected_grad_norm_ratio"] = (
+                    self.accelerator.gather_for_metrics(chosen_rejected_grad_norm_ratio).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/chosen_loss_grad_total_cosine"] = (
+                    self.accelerator.gather_for_metrics(chosen_total_cos).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/rejected_loss_grad_total_cosine"] = (
+                    self.accelerator.gather_for_metrics(rejected_total_cos).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/chosen_rejected_grad_cosine"] = (
+                    self.accelerator.gather_for_metrics(chosen_rejected_cos).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/combined_loss_grad_total_cosine"] = (
+                    self.accelerator.gather_for_metrics(combined_total_cos).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/total_grad_norm"] = (
+                    self.accelerator.gather_for_metrics(grad_norm(full_param_grad)).detach().mean().item()
+                )
+                metrics[f"{prefix}grads/decomposition_residual_norm"] = (
+                    self.accelerator.gather_for_metrics(decomposition_residual).detach().mean().item()
+                )
+            finally:
+                if was_training:
+                    model.train()
         return loss, metrics
 
     def log(self, logs, start_time=None):

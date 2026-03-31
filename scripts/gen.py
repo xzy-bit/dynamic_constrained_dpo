@@ -28,6 +28,12 @@ def main():
     ap.add_argument("--output_file", type=str, default=None, help="Override output path.")
     ap.add_argument("--model_path", type=str, default=None, help="Override model checkpoint/repo.")
     ap.add_argument("--generator_name", type=str, default=None, help="Override generator name.")
+    ap.add_argument(
+        "--tensor_parallel_size",
+        type=int,
+        default=None,
+        help="Override vLLM tensor parallel size. Defaults to available CUDA devices, or 1.",
+    )
     args = ap.parse_args()
 
     # -------------------------
@@ -49,7 +55,7 @@ def main():
         raise ValueError("Missing model path/name. Provide --model_path or set completions_kwargs.model_name in YAML.")
 
     # Tokenizer: 如果 YAML 不提供，就默认等于 model_name；也允许 CLI 覆盖
-    tokenizer_name = pick(completions_kwargs, "tokenizer_name_or_path", None)
+    tokenizer_name = pick(completions_kwargs, "tokenizer_name_or_path", None) or model_name
 
     # Prompt template path (YAML: prompt_template)
     prompt_template_path = pick(cfg_all, "prompt_template", None)
@@ -82,12 +88,29 @@ def main():
     # vLLM init config (consume subset from YAML)
     # -------------------------
 
+    tp_size = args.tensor_parallel_size
+    if tp_size is None:
+        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if cuda_visible_devices:
+            visible = [device for device in cuda_visible_devices.split(",") if device.strip()]
+            tp_size = len(visible) if visible else 1
+        else:
+            try:
+                import torch
+
+                tp_size = torch.cuda.device_count()
+            except Exception:
+                tp_size = 1
+        tp_size = max(tp_size, 1)
+
     llm_kwargs: Dict[str, Any] = dict(
         model=model_name,
         tokenizer=tokenizer_name,
         trust_remote_code=True,
-        tensor_parallel_size=4,
+        tensor_parallel_size=tp_size,
         dtype="bfloat16",
+        enforce_eager=True,
+        disable_custom_all_reduce=True,
     )
 
     print("Initializing vLLM...")
@@ -131,6 +154,7 @@ def main():
             "generator": args.generator_name,
         })
 
+    ensure_dir_for_file(args.output_file)
     with open(args.output_file, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 

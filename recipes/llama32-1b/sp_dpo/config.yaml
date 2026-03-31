@@ -14,7 +14,7 @@ sp_alpha: 1.5
 sp_beta: 0.2
 sp_temperature: 2.0
 do_eval: false
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 32
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: False
@@ -30,7 +30,7 @@ adam_beta1: 0.9
 adam_beta2: 0.999
 output_dir: results/model/sp_dpo_llama32_1b
 sp_neg_support_coef: 1.0
-per_device_train_batch_size: 4
+per_device_train_batch_size: 1
 report_to:
 - wandb
 save_strategy: 'no'

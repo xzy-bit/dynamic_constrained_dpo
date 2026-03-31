@@ -16,7 +16,7 @@ sp_beta: 0.2
 sp_temperature: 2.0
 sp_neg_support_coef: 1.05
 do_eval: false
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 16
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: False
@@ -31,7 +31,7 @@ optim: adamw_torch
 adam_beta1: 0.9
 adam_beta2: 0.999
 output_dir: results/model/sp_simpo_llama32_1b
-per_device_train_batch_size: 4
+per_device_train_batch_size: 2
 report_to:
 - wandb
 save_strategy: 'no'
