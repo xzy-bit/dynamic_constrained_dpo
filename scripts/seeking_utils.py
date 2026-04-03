@@ -68,6 +68,38 @@ def grad_cosine(grad_a: torch.Tensor | None, grad_b: torch.Tensor | None) -> tor
     return torch.dot(vec_a, vec_b) / denom
 
 
+def flatten_grad_list(grads) -> torch.Tensor | None:
+    if grads is None:
+        return None
+    flat_parts = [grad.reshape(-1) for grad in grads if grad is not None]
+    if not flat_parts:
+        return None
+    return torch.cat(flat_parts)
+
+
+def grad_list_norm(grads) -> torch.Tensor:
+    flat = flatten_grad_list(grads)
+    if flat is None:
+        return _zero_on_device()
+    return flat.norm()
+
+
+def grad_list_inner(grads_a, grads_b) -> torch.Tensor:
+    flat_a = flatten_grad_list(grads_a)
+    flat_b = flatten_grad_list(grads_b)
+
+    device = None
+    for tensor in (flat_a, flat_b):
+        if tensor is not None:
+            device = tensor.device
+            break
+
+    if flat_a is None or flat_b is None:
+        return _zero_on_device(device)
+
+    return torch.dot(flat_a, flat_b)
+
+
 def get_last_layer_weight(model):
     output_embeddings = getattr(model, "get_output_embeddings", None)
     if callable(output_embeddings):

@@ -58,24 +58,40 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import DPOConfig, ScriptArguments, get_dataset, get_model, get_tokenizer
+from dynamic_lambda_dpo_config import DynamicLambdaDPOConfig
+from dynamic_lambda_dpo_trainer import DynamicLambdaDPOTrainer
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 from dpo_metrics_trainer import DPOMetricsTrainer
 from hypo_dpo_trainer import HypoDPOTrainer
 from simpo_config import SimPOConfig
 from simpo_trainer import SimPOTrainer
-from sp_dpo_config import SPDPOConfig
-from sp_dpo_trainer import SPDPOTrainer
-from sp_simpo_config import SPSimPOConfig
-from sp_simpo_trainer import SPSimPOTrainer
+
+try:
+    from sp_dpo_config import SPDPOConfig
+    from sp_dpo_trainer import SPDPOTrainer
+except ImportError:
+    SPDPOConfig = None
+    SPDPOTrainer = None
+
+try:
+    from sp_simpo_config import SPSimPOConfig
+    from sp_simpo_trainer import SPSimPOTrainer
+except ImportError:
+    SPSimPOConfig = None
+    SPSimPOTrainer = None
 
 TRAINER_REGISTRY = {
     "dpo": DPOMetricsTrainer,
+    "dynamic_lambda_dpo": DynamicLambdaDPOTrainer,
     "hypo_dpo": HypoDPOTrainer,
-    "sp_dpo": SPDPOTrainer,
-    # "sp_hypo": SPHypoTrainer,  # Disabled: local repo does not include sp_hypo implementation/config.
-    "sp_simpo": SPSimPOTrainer,
     "simpo": SimPOTrainer,
 }
+
+if SPDPOTrainer is not None:
+    TRAINER_REGISTRY["sp_dpo"] = SPDPOTrainer
+
+if SPSimPOTrainer is not None:
+    TRAINER_REGISTRY["sp_simpo"] = SPSimPOTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +225,21 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
             sp_temperature=training_args.sp_temperature,
             sp_neg_support_coef=training_args.sp_neg_support_coef,
         )
+    elif trainer_name == "dynamic_lambda_dpo":
+        trainer = TrainerCls(
+            model,
+            ref_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            dlambda_alpha=training_args.dlambda_alpha,
+            dlambda_epsilon=training_args.dlambda_epsilon,
+            dlambda_lambda_max=training_args.dlambda_lambda_max,
+            dlambda_grad_target=training_args.dlambda_grad_target,
+            dlambda_reference_free=training_args.dlambda_reference_free,
+            dlambda_logp_aggregation=training_args.dlambda_logp_aggregation,
+        )
     elif trainer_name == "sp_dpo":
         trainer = TrainerCls(
             model,
@@ -278,9 +309,15 @@ if __name__ == "__main__":
         if pre_args.trainer == "simpo":
             config_cls = SimPOConfig
         elif pre_args.trainer == "sp_simpo":
+            if SPSimPOConfig is None:
+                raise ImportError("sp_simpo trainer/config is not available in this workspace.")
             config_cls = SPSimPOConfig
         elif pre_args.trainer == "sp_dpo":
+            if SPDPOConfig is None:
+                raise ImportError("sp_dpo trainer/config is not available in this workspace.")
             config_cls = SPDPOConfig
+        elif pre_args.trainer == "dynamic_lambda_dpo":
+            config_cls = DynamicLambdaDPOConfig
         else:
             config_cls = DPOConfig
         parser = TrlParser((ScriptArguments, config_cls, ModelConfig))

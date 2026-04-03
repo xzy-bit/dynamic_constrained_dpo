@@ -1,0 +1,239 @@
+==============================
+Dynamic Lambda Constrained Preference Optimization Summary
+==============================
+
+[1] 核心思想
+------------------------------
+目标：
+    min F(θ)
+    s.t. g(θ) ≤ 0
+
+其中：
+    F(θ): preference loss
+    g(θ): KL constraint
+
+更新方向：
+    d = -∇F - λ ∇g
+
+动态系数：
+    λ = max((α g - <∇g, ∇F>) / ||∇g||^2, 0)
+
+关键思想：
+    - 不使用固定 β（如 DPO）
+    - 用当前 batch 的梯度几何关系动态计算 λ
+    - 实现“自适应 trade-off”
+
+------------------------------------------------
+
+[2] Preference Loss（无 ref）
+------------------------------
+Δθ(x, yw, yl) = log πθ(yw|x) - log πθ(yl|x)
+
+F(θ) = E[-log σ(Δθ)]
+
+说明：
+    - 不包含 ref
+    - ref 只出现在 constraint 中
+
+------------------------------------------------
+
+[3] KL Constraint（工程近似）
+------------------------------
+真实形式：
+    g(θ) = E[D_KL(πθ || π_ref)] - ε
+
+工程 surrogate：
+    g_hat = mean(logπθ(y|x) - logπref(y|x)) - ε
+
+实现：
+    - 用 chosen / rejected 平均
+    - 不做 full distribution KL
+
+------------------------------------------------
+
+[4] 正确计算流程（重要）
+------------------------------
+
+Step 1: forward
+    计算：
+        F = preference loss
+        g = KL surrogate
+
+Step 2: 取梯度（不写入 .grad）
+    grad_F = autograd.grad(F, params)
+    grad_g = autograd.grad(g, params)
+
+Step 3: 计算 λ
+    inner = <grad_g, grad_F>
+    norm2 = ||grad_g||^2
+
+    λ = max((α g - inner) / (norm2 + eps), 0)
+    λ = clip(λ)
+    λ = detach(λ)
+
+Step 4: 构造 loss
+    L_total = F + λ g
+
+Step 5: 正常 backward
+    L_total.backward()
+    optimizer.step()
+
+关键点：
+    λ 必须 detach，否则会引入错误梯度
+
+------------------------------------------------
+
+[5] 与“直接改梯度”的关系
+------------------------------
+两种实现方式等价：
+
+方法A（推荐）：
+    loss = F + λ g
+    backward()
+
+方法B（更底层）：
+    手动计算：
+        grad = grad_F + λ grad_g
+    写入 param.grad
+
+结论：
+    数学等价，但工程上推荐方法A（更兼容）
+
+------------------------------------------------
+
+[6] TRL / DeepSpeed 兼容性
+------------------------------
+
+问题：
+    TRL 封装了 backward 和 optimizer.step
+
+解决方案：
+
+方案1（推荐）：
+    在 compute_loss 中：
+        - 用 autograd.grad 计算 λ
+        - 返回 F + λ g
+
+方案2（更底层）：
+    - 继承 Trainer
+    - 重写 training_step
+    - 手动控制 grad
+
+------------------------------------------------
+
+[7] 分布式（ZeRO）讨论
+------------------------------
+
+ZeRO-1：
+    - 参数和梯度完整
+    - 可直接计算 grad inner product
+
+ZeRO-2 / ZeRO-3：
+    - 梯度/参数分片
+    - 难以直接计算 inner/norm
+
+建议：
+    第一版使用：
+        LoRA + ZeRO-1 或 DDP
+
+------------------------------------------------
+
+[8] local λ vs global λ
+------------------------------
+
+local λ（推荐起步）：
+    每个 minibatch 单独计算 λ
+
+优点：
+    - 无需 all-reduce
+    - 更简单
+    - 更自适应
+
+缺点：
+    - 噪声更大
+
+global λ：
+    需要同步：
+        inner / norm2 / g
+
+结论：
+    先做 local λ
+
+------------------------------------------------
+
+[9] 工程优化建议
+------------------------------
+
+(1) λ stability
+    - clip λ
+    - EMA smoothing
+
+(2) 数值稳定
+    norm2 + 1e-12
+
+(3) 降低开销
+    - 只对 LoRA params 算梯度
+    - 或只用部分层
+
+(4) length normalization
+    - sum logp vs mean logp
+
+------------------------------------------------
+
+[10] 最小可行版本（推荐起步）
+------------------------------
+
+不计算 inner product：
+
+    λ = max(α g, 0)
+
+优点：
+    - 无需 autograd.grad
+    - 非常稳定
+    - 先验证 idea
+
+------------------------------------------------
+
+[11] 关键监控指标
+------------------------------
+
+必须记录：
+
+    g_hat
+    λ
+    <∇g, ∇F>
+    ||∇g||^2
+    ||∇F||, ||∇g||, ||grad_total||
+
+    chosen logp
+    rejected logp
+    margin
+
+------------------------------------------------
+
+[12] 本方法本质
+------------------------------
+
+从：
+
+    linear combination (DPO / β)
+
+变为：
+
+    constrained optimization + gradient projection
+
+核心转变：
+
+    fixed trade-off → dynamic geometry-aware trade-off
+
+------------------------------------------------
+
+[13] 一句话总结
+------------------------------
+
+先用当前 minibatch 的梯度估计一个动态 λ，
+再用 loss = F + λ g 让 autograd 自动产生组合梯度完成更新。
+
+==============================
+END
+==============================
