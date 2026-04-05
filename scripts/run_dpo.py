@@ -174,6 +174,9 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
         training_args.truncation_side = "left"
     model = get_model(model_args, training_args)
     use_reference_model = trainer_name not in {"simpo", "sp_simpo"}
+    offline_ref_logps_dir = getattr(training_args, "offline_ref_logps_dir", None)
+    if offline_ref_logps_dir:
+        use_reference_model = False
     ref_model = get_model(model_args, training_args) if use_reference_model else None
     tokenizer = get_tokenizer(model_args, training_args)
     if tokenizer.pad_token is None:
@@ -187,16 +190,20 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
     #########
     # Dataset
     #########
-    raw_dataset = get_dataset(script_args)["train_prefs"]
+    if offline_ref_logps_dir:
+        logger.info(f"Loading offline reference-logprob dataset from {offline_ref_logps_dir}")
+        dataset = datasets.load_from_disk(offline_ref_logps_dir)
+    else:
+        raw_dataset = get_dataset(script_args)["train_prefs"]
 
-    column_names = list(raw_dataset.features)
+        column_names = list(raw_dataset.features)
 
-    dataset = raw_dataset.map(
-        apply_chat_template,
-        fn_kwargs={"tokenizer": tokenizer},
-        num_proc=8,
-        remove_columns=column_names,
-        desc="Apply chat template (SimPO-style)")
+        dataset = raw_dataset.map(
+            apply_chat_template,
+            fn_kwargs={"tokenizer": tokenizer},
+            num_proc=8,
+            remove_columns=column_names,
+            desc="Apply chat template (SimPO-style)")
 
     ##########
     # Training

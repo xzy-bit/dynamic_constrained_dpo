@@ -17,6 +17,28 @@ class DPOMetricsTrainer(DPOTrainer):
         self.grad_metrics_interval = max(int(os.environ.get("DPO_GRAD_METRICS_INTERVAL", "5")), 1)
         self._last_grad_metrics_step = -1
 
+    def _prepare_dataset(self, dataset, processing_class, args, dataset_name):
+        tokenized_columns = {"prompt_input_ids", "chosen_input_ids", "rejected_input_ids"}
+        if tokenized_columns.issubset(set(getattr(dataset, "column_names", []))):
+            return dataset
+        return super()._prepare_dataset(dataset, processing_class, args, dataset_name)
+
+    def _aggregate_logps(self, per_token_logps: torch.Tensor, loss_mask: torch.Tensor) -> torch.Tensor:
+        aggregation = getattr(self, "logp_aggregation", None)
+        if aggregation is None:
+            aggregation = getattr(self, "dlambda_logp_aggregation", None)
+
+        if aggregation == "mean":
+            token_counts = loss_mask.sum(-1).clamp_min(1)
+            return per_token_logps.sum(-1) / token_counts
+        if aggregation not in (None, "sum"):
+            raise ValueError(f"Unsupported log-prob aggregation: {aggregation}")
+
+        all_logps = per_token_logps.sum(-1)
+        if self.loss_type == "ipo":
+            all_logps = all_logps / loss_mask.sum(-1).clamp_min(1)
+        return all_logps
+
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         num_examples = batch["prompt_input_ids"].shape[0]
 
@@ -110,7 +132,7 @@ class DPOMetricsTrainer(DPOTrainer):
             per_token_logps_[attention_mask.bool()] = per_token_logps
             per_token_logps = per_token_logps_
 
-        all_logps = per_token_logps.sum(-1)
+        all_logps = self._aggregate_logps(per_token_logps, loss_mask)
         output = {}
 
         if self.use_weighting:
@@ -129,9 +151,6 @@ class DPOMetricsTrainer(DPOTrainer):
             output["nll_loss"] = F.cross_entropy(
                 torch.flatten(chosen_logits, end_dim=1), torch.flatten(chosen_labels, end_dim=1), ignore_index=0
             )
-
-        if self.loss_type == "ipo":
-            all_logps = all_logps / loss_mask.sum(-1)
 
         output["chosen_logps"] = all_logps[:num_examples]
         output["rejected_logps"] = all_logps[num_examples:]
@@ -191,21 +210,21 @@ class DPOMetricsTrainer(DPOTrainer):
                 remapped_metrics[f"seeking/{key}"] = value
         metrics = remapped_metrics
 
-        prefix = "seeking_eval/" if train_eval == "eval" else "seeking/"
-        metrics[f"{prefix}scores/chosen"] = self.accelerator.gather_for_metrics(chosen_score).detach().mean().item()
-        metrics[f"{prefix}scores/rejected"] = (
+        prefix = "eval/" if train_eval == "eval" else "train/"
+        metrics[f"{prefix}/chosen"] = self.accelerator.gather_for_metrics(chosen_score).detach().mean().item()
+        metrics[f"{prefix}/rejected"] = (
             self.accelerator.gather_for_metrics(rejected_score).detach().mean().item()
         )
-        metrics[f"{prefix}scores/accuracies"] = (
+        metrics[f"{prefix}/accuracies"] = (
             self.accelerator.gather_for_metrics(objective_accuracy).detach().mean().item()
         )
-        metrics[f"{prefix}scores/raw_margins"] = (
+        metrics[f"{prefix}/raw_margins"] = (
             self.accelerator.gather_for_metrics(raw_margin).detach().mean().item()
         )
-        metrics[f"{prefix}scores/objective_margins"] = (
+        metrics[f"{prefix}/objective_margins"] = (
             self.accelerator.gather_for_metrics(objective_margin).detach().mean().item()
         )
-        metrics[f"{prefix}scores/sigmoid_margins"] = (
+        metrics[f"{prefix}/sigmoid_margins"] = (
             self.accelerator.gather_for_metrics(sigmoid_margin).detach().mean().item()
         )
         should_compute_grad_metrics = self.enable_grad_metrics

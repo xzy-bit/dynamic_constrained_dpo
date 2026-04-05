@@ -6,6 +6,10 @@ from alignment import DPOConfig
 
 @dataclass
 class DynamicLambdaDPOConfig(DPOConfig):
+    offline_ref_logps_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional dataset directory containing precomputed ref_chosen_logps/ref_rejected_logps."},
+    )
     dlambda_alpha: float = field(
         default=1.0,
         metadata={"help": "Alpha coefficient in lambda = max((alpha * g - <grad_g, grad_f>) / ||grad_g||^2, 0)."},

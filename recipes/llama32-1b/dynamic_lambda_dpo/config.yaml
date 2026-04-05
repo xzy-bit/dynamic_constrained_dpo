@@ -17,7 +17,7 @@ dlambda_grad_target: last_three_layers
 dlambda_reference_free: false
 dlambda_logp_aggregation: sum
 do_eval: false
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: False
@@ -32,7 +32,7 @@ optim: adamw_torch
 adam_beta1: 0.9
 adam_beta2: 0.999
 output_dir: results/model/dynamic_lambda_dpo_llama32_1b
-per_device_train_batch_size: 4
+per_device_train_batch_size: 8
 report_to:
 - wandb
 save_strategy: "no"
