@@ -58,6 +58,7 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import DPOConfig, ScriptArguments, get_dataset, get_model, get_tokenizer
+from async_dynamic_lambda_dpo_trainer import AsyncDynamicLambdaDPOTrainer
 from dynamic_lambda_dpo_config import DynamicLambdaDPOConfig
 from dynamic_lambda_dpo_trainer import DynamicLambdaDPOTrainer
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
@@ -82,6 +83,7 @@ except ImportError:
 
 TRAINER_REGISTRY = {
     "dpo": DPOMetricsTrainer,
+    "async_dynamic_lambda_dpo": AsyncDynamicLambdaDPOTrainer,
     "dynamic_lambda_dpo": DynamicLambdaDPOTrainer,
     "hypo_dpo": HypoDPOTrainer,
     "simpo": SimPOTrainer,
@@ -232,7 +234,7 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
             sp_temperature=training_args.sp_temperature,
             sp_neg_support_coef=training_args.sp_neg_support_coef,
         )
-    elif trainer_name == "dynamic_lambda_dpo":
+    elif trainer_name in {"dynamic_lambda_dpo", "async_dynamic_lambda_dpo"}:
         trainer = TrainerCls(
             model,
             ref_model,
@@ -323,7 +325,7 @@ if __name__ == "__main__":
             if SPDPOConfig is None:
                 raise ImportError("sp_dpo trainer/config is not available in this workspace.")
             config_cls = SPDPOConfig
-        elif pre_args.trainer == "dynamic_lambda_dpo":
+        elif pre_args.trainer in {"dynamic_lambda_dpo", "async_dynamic_lambda_dpo"}:
             config_cls = DynamicLambdaDPOConfig
         else:
             config_cls = DPOConfig

@@ -23,7 +23,7 @@ class DynamicLambdaDPOConfig(DPOConfig):
         metadata={"help": "Optional upper clip for the dynamic lambda. Set to null to disable clipping."},
     )
     dlambda_grad_target: Literal["all", "last_three_layers"] = field(
-        default="all",
+        default="last_three_layers",
         metadata={"help": "Which trainable parameters to use when estimating grad_F and grad_g for lambda."},
     )
     dlambda_reference_free: bool = field(
