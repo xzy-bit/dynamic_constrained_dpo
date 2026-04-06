@@ -4,6 +4,11 @@ from datetime import datetime
 
 import torch
 
+try:
+    import wandb
+except ImportError:  # pragma: no cover - optional dependency
+    wandb = None
+
 
 def get_repo_root() -> str:
     return os.path.dirname(os.path.dirname(__file__))
@@ -19,6 +24,20 @@ def append_seeking_log(name: str, logs: dict) -> None:
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    if wandb is not None and wandb.run is not None:
+        step = record.get("step")
+        payload = {}
+        for key, value in record.items():
+            if key in {"timestamp", "step"}:
+                continue
+            if isinstance(value, (int, float, bool)):
+                payload[f"seeking/{name}/{key}"] = value
+        if payload:
+            if isinstance(step, int):
+                wandb.log(payload, step=step)
+            else:
+                wandb.log(payload)
 
 
 def flatten_grad(grad: torch.Tensor | None) -> torch.Tensor | None:

@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
@@ -21,6 +22,47 @@ def ensure_dir_for_file(path: str) -> None:
 def pick(d: Dict[str, Any], key: str, default: Any = None) -> Any:
     return d.get(key, default) if isinstance(d, dict) else default
 
+
+def resolve_model_path(model_name: str) -> str:
+    if not os.path.isdir(model_name):
+        return model_name
+
+    def is_model_dir(path: str) -> bool:
+        return os.path.isfile(os.path.join(path, "config.json")) or os.path.isfile(os.path.join(path, "params.json"))
+
+    if is_model_dir(model_name):
+        return model_name
+
+    candidate_subdirs = []
+    for child in sorted(os.listdir(model_name)):
+        child_path = os.path.join(model_name, child)
+        if os.path.isdir(child_path) and is_model_dir(child_path):
+            candidate_subdirs.append(child_path)
+
+    if len(candidate_subdirs) == 1:
+        resolved = candidate_subdirs[0]
+        print(f"Resolved model path from {model_name} to nested model directory {resolved}")
+        return resolved
+
+    return model_name
+
+
+def load_alpaca_eval_split() -> List[Dict[str, Any]]:
+    try:
+        dataset = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", split="eval")
+        return list(dataset)
+    except RuntimeError as exc:
+        if "Dataset scripts are no longer supported" not in str(exc):
+            raise
+
+    json_path = hf_hub_download(
+        repo_id="tatsu-lab/alpaca_eval",
+        repo_type="dataset",
+        filename="alpaca_eval.json",
+    )
+    with open(json_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -33,6 +75,12 @@ def main():
         type=int,
         default=None,
         help="Override vLLM tensor parallel size. Defaults to available CUDA devices, or 1.",
+    )
+    ap.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.85,
+        help="vLLM GPU memory utilization target.",
     )
     args = ap.parse_args()
 
@@ -53,9 +101,17 @@ def main():
     model_name = args.model_path or pick(completions_kwargs, "model_name", None)
     if model_name is None:
         raise ValueError("Missing model path/name. Provide --model_path or set completions_kwargs.model_name in YAML.")
+    model_name = resolve_model_path(model_name)
 
-    # Tokenizer: 如果 YAML 不提供，就默认等于 model_name；也允许 CLI 覆盖
-    tokenizer_name = pick(completions_kwargs, "tokenizer_name_or_path", None) or model_name
+    # Tokenizer:
+    # - if a local/model override is provided, prefer that model's tokenizer
+    # - otherwise fall back to the YAML tokenizer_name_or_path
+    # This avoids accidentally pulling a gated base tokenizer from the eval config
+    # when evaluating a locally saved fine-tuned checkpoint.
+    if args.model_path is not None:
+        tokenizer_name = model_name
+    else:
+        tokenizer_name = pick(completions_kwargs, "tokenizer_name_or_path", None) or model_name
 
     # Prompt template path (YAML: prompt_template)
     prompt_template_path = pick(cfg_all, "prompt_template", None)
@@ -68,7 +124,7 @@ def main():
     # Dataset
     # -------------------------
     print("Loading AlpacaEval dataset...")
-    eval_dataset = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", split="eval")
+    eval_dataset = load_alpaca_eval_split()
 
     def format_prompt(instruction):
         return prompt_template.format(instruction=instruction)
@@ -111,6 +167,7 @@ def main():
         dtype="bfloat16",
         enforce_eager=True,
         disable_custom_all_reduce=True,
+        gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
     print("Initializing vLLM...")
@@ -130,7 +187,7 @@ def main():
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
-        n=16,
+        n=1,
     )
     if stop_token_ids:
         sampling_kwargs["stop_token_ids"] = [int(x) for x in stop_token_ids]

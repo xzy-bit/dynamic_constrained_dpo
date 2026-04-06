@@ -33,11 +33,9 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         self.grad_collection_debug = os.getenv("DYNAMIC_LAMBDA_GRAD_DEBUG", "0") == "1"
         self._last_grad_rewrite_step = -1
         self._last_grad_collection_debug_step = -1
-        self._grad_f_buffer = {}
-        self._grad_g_buffer = {}
+        self._final_grad_buffer = {}
         self._grad_buffer_dtypes = {}
-        self._constraint_sum = None
-        self._constraint_count = 0
+        self._manual_micro_steps = 0
 
     def _trainable_grad_params(self, model):
         return [
@@ -56,12 +54,23 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         target_names = set(target_names) if target_names is not None else None
         params = {}
         grads = {}
+        sampled = 0
         for name, param in engine.module.named_parameters():
             if not param.requires_grad:
                 continue
             if target_names is not None and name not in target_names:
                 continue
+            if sampled < 2:
+                self._maybe_debug_memory_probe("before_safe_get_full_grad", {"name": name})
             grad = safe_get_full_grad(param)
+            if sampled < 2:
+                extra = {"name": name, "grad_is_none": grad is None}
+                if grad is not None:
+                    extra["grad_dtype"] = str(grad.dtype)
+                    extra["grad_numel"] = grad.numel()
+                    extra["grad_elem_bytes"] = grad.element_size()
+                self._maybe_debug_memory_probe("after_safe_get_full_grad", extra)
+                sampled += 1
             if grad is None:
                 continue
             params[name] = param
@@ -69,131 +78,257 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         return params, grads
 
     def _accumulate_grad_buffer(self, buffer_dict, grads):
-        for name, grad in grads.items():
+        for idx, (name, grad) in enumerate(grads.items()):
             self._grad_buffer_dtypes[name] = grad.dtype
+            if idx < 2:
+                self._maybe_debug_memory_probe("before_grad_to_fp16", {"name": name, "grad_dtype": str(grad.dtype)})
             grad_buffer = grad.detach().to(dtype=torch.float16)
+            if idx < 2:
+                self._maybe_debug_memory_probe(
+                    "after_grad_to_fp16",
+                    {"name": name, "buffer_dtype": str(grad_buffer.dtype), "buffer_numel": grad_buffer.numel()},
+                )
+            if name in buffer_dict:
+                buffer_dict[name] = buffer_dict[name] + grad_buffer
+            else:
+                buffer_dict[name] = grad_buffer.clone()
+
+    def _accumulate_scaled_grad_buffer(self, buffer_dict, grads, scale):
+        scale_value = float(scale.detach().float().item()) if isinstance(scale, torch.Tensor) else float(scale)
+        for idx, (name, grad) in enumerate(grads.items()):
+            self._grad_buffer_dtypes[name] = grad.dtype
+            if idx < 2:
+                self._maybe_debug_memory_probe(
+                    "before_scaled_grad_to_fp16",
+                    {"name": name, "grad_dtype": str(grad.dtype), "scale": f"{scale_value:.6e}"},
+                )
+            grad_buffer = (grad.detach().float() * scale_value).to(dtype=torch.float16)
+            if idx < 2:
+                self._maybe_debug_memory_probe(
+                    "after_scaled_grad_to_fp16",
+                    {"name": name, "buffer_dtype": str(grad_buffer.dtype), "buffer_numel": grad_buffer.numel()},
+                )
             if name in buffer_dict:
                 buffer_dict[name] = buffer_dict[name] + grad_buffer
             else:
                 buffer_dict[name] = grad_buffer.clone()
 
     def _reset_grad_rewrite_state(self):
-        self._grad_f_buffer = {}
-        self._grad_g_buffer = {}
+        self._final_grad_buffer = {}
         self._grad_buffer_dtypes = {}
-        self._constraint_sum = None
-        self._constraint_count = 0
+
+    def _debug_rank(self):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return 0
+
+    def _buffer_debug_summary(self, buffer_dict):
+        if not buffer_dict:
+            return "count=0"
+
+        total_norm = 0.0
+        nonzero_count = 0
+        for grad in buffer_dict.values():
+            grad_norm = grad.float().norm().item()
+            total_norm += grad_norm
+            if grad_norm > 0:
+                nonzero_count += 1
+        return (
+            f"count={len(buffer_dict)} "
+            f"nonzero_count={nonzero_count} "
+            f"total_norm={total_norm:.6f}"
+        )
+
+    def _maybe_debug_step_state(
+        self,
+        step_label,
+        engine,
+        boundary=None,
+    ):
+        if not self.grad_collection_debug:
+            return
+        ds_grad_acc_steps = (
+            engine.gradient_accumulation_steps() if hasattr(engine, "gradient_accumulation_steps") else "n/a"
+        )
+        micro_steps = getattr(engine, "micro_steps", "n/a")
+        manual_micro_steps = self._manual_micro_steps
+
+        print(
+            "[dlambda_step]",
+            f"rank={self._debug_rank()}",
+            f"step={self.state.global_step}",
+            f"phase={step_label}",
+            f"micro_steps={micro_steps}",
+            f"manual_micro_steps={manual_micro_steps}",
+            f"trainer_gas={self.args.gradient_accumulation_steps}",
+            f"engine_gas={ds_grad_acc_steps}",
+            f"boundary={boundary}",
+        )
 
     def _maybe_debug_grad_collection(self, step_label, target_names, grads, loss_name):
         if not self.grad_collection_debug:
             return
-        step_id = f"{self.state.global_step}:{step_label}:{loss_name}"
-        if step_id == self._last_grad_collection_debug_step:
-            return
-        self._last_grad_collection_debug_step = step_id
+        return
 
-        found_names = list(grads.keys())
-        missing_names = [name for name in target_names if name not in grads]
-        sample_found = found_names[:3]
-        sample_missing = missing_names[:3]
+    def _cuda_mem_stats(self):
+        if not torch.cuda.is_available():
+            return None
+        device = torch.cuda.current_device()
+        return {
+            "device": device,
+            "allocated_mb": torch.cuda.memory_allocated(device) / (1024**2),
+            "reserved_mb": torch.cuda.memory_reserved(device) / (1024**2),
+            "max_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024**2),
+        }
+
+    def _maybe_debug_memory_probe(self, label, extra=None):
+        if not self.grad_collection_debug:
+            return
+        stats = self._cuda_mem_stats()
+        if stats is None:
+            return
+        parts = [
+            "[dlambda_mem]",
+            f"rank={self._debug_rank()}",
+            f"step={self.state.global_step}",
+            f"label={label}",
+            f"allocated_mb={stats['allocated_mb']:.2f}",
+            f"reserved_mb={stats['reserved_mb']:.2f}",
+            f"max_allocated_mb={stats['max_allocated_mb']:.2f}",
+        ]
+        if extra:
+            for key, value in extra.items():
+                parts.append(f"{key}={value}")
+        print(*parts)
+
+    def _maybe_debug_constraint_components(
+        self,
+        policy_chosen_logps: torch.Tensor,
+        policy_rejected_logps: torch.Tensor,
+        ref_chosen_logps: torch.Tensor,
+        ref_rejected_logps: torch.Tensor,
+        constraint_value: torch.Tensor,
+    ):
+        if not self.grad_collection_debug:
+            return
+
+        policy_chosen_mean = policy_chosen_logps.float().mean()
+        policy_rejected_mean = policy_rejected_logps.float().mean()
+        ref_chosen_mean = ref_chosen_logps.float().mean()
+        ref_rejected_mean = ref_rejected_logps.float().mean()
+        chosen_kl = (policy_chosen_logps.float() - ref_chosen_logps.float()).mean()
+        rejected_kl = (policy_rejected_logps.float() - ref_rejected_logps.float()).mean()
+
         print(
-            "[grad_collection_debug]",
-            f"global_step={self.state.global_step}",
-            f"loss_name={loss_name}",
-            f"target_count={len(target_names)}",
-            f"found_count={len(found_names)}",
-            f"missing_count={len(missing_names)}",
-            f"sample_found={sample_found}",
-            f"sample_missing={sample_missing}",
+            "[dlambda_constraint_raw]",
+            f"rank={self._debug_rank()}",
+            f"step={self.state.global_step}",
+            f"policy_chosen_mean={policy_chosen_mean.detach().item():.12e}",
+            f"ref_chosen_mean={ref_chosen_mean.detach().item():.12e}",
+            f"chosen_kl_mean={chosen_kl.detach().item():.12e}",
+            f"policy_rejected_mean={policy_rejected_mean.detach().item():.12e}",
+            f"ref_rejected_mean={ref_rejected_mean.detach().item():.12e}",
+            f"rejected_kl_mean={rejected_kl.detach().item():.12e}",
+            f"constraint_value={constraint_value.detach().float().item():.12e}",
         )
 
     def _compute_batch_state(self, model, batch):
         model_output = self.concatenated_forward(model, batch)
+        chosen_logps = model_output["chosen_logps"]
+        rejected_logps = model_output["rejected_logps"]
+        del model_output
+
         if self.dlambda_reference_free:
-            ref_chosen_logps = torch.zeros_like(model_output["chosen_logps"])
-            ref_rejected_logps = torch.zeros_like(model_output["rejected_logps"])
+            ref_chosen_logps = torch.zeros_like(chosen_logps)
+            ref_rejected_logps = torch.zeros_like(rejected_logps)
         elif "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
             ref_chosen_logps = batch["ref_chosen_logps"]
             ref_rejected_logps = batch["ref_rejected_logps"]
         else:
             ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
 
-        policy_margin = model_output["chosen_logps"] - model_output["rejected_logps"]
+        policy_margin = chosen_logps - rejected_logps
         preference_losses = -F.logsigmoid(policy_margin)
         preference_loss = preference_losses.mean()
         constraint_value = self._constraint_value(
-            model_output["chosen_logps"],
-            model_output["rejected_logps"],
+            chosen_logps,
+            rejected_logps,
             ref_chosen_logps,
             ref_rejected_logps,
         )
+        self._maybe_debug_constraint_components(
+            chosen_logps,
+            rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+            constraint_value,
+        )
         return {
-            "model_output": model_output,
-            "ref_chosen_logps": ref_chosen_logps,
-            "ref_rejected_logps": ref_rejected_logps,
             "policy_margin": policy_margin,
             "preference_loss": preference_loss,
             "constraint_value": constraint_value,
         }
 
-    def _compute_dynamic_lambda_from_buffers(self, device):
-        if not self._grad_g_buffer:
+    def _compute_dynamic_lambda_from_grads(self, grads_f, grads_g, constraint_value, device):
+        if not grads_g:
             return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
         grad_target_names = self._lambda_param_names(self.deepspeed.module)
-        grad_f = [self._grad_f_buffer.get(name) for name in grad_target_names]
-        grad_g = [self._grad_g_buffer.get(name) for name in grad_target_names]
+        grad_f = [grads_f.get(name) for name in grad_target_names]
+        grad_g = [grads_g.get(name) for name in grad_target_names]
 
         grad_inner = self._grad_list_inner(grad_g, grad_f, device=device)
         grad_g_norm = self._grad_list_norm(grad_g, device=device)
         grad_g_norm_sq = grad_g_norm.pow(2)
-
-        if self._constraint_sum is None or self._constraint_count == 0:
-            constraint_mean = torch.tensor(0.0, device=device)
-        else:
-            constraint_mean = self._constraint_sum / self._constraint_count
+        constraint_mean = constraint_value.detach().float()
 
         numerator = self.dlambda_alpha * constraint_mean - grad_inner.detach()
         dynamic_lambda = torch.clamp(numerator / grad_g_norm_sq.clamp_min(1e-12), min=0.0)
         if self.dlambda_lambda_max is not None:
             dynamic_lambda = torch.clamp(dynamic_lambda, max=self.dlambda_lambda_max)
 
+        if self.grad_collection_debug:
+            print(
+                "[dlambda_value]",
+                f"rank={self._debug_rank()}",
+                f"step={self.state.global_step}",
+                f"constraint_mean={constraint_mean.detach().float().item():.8f}",
+                f"grad_inner={grad_inner.detach().float().item():.8f}",
+                f"grad_g_norm_sq={grad_g_norm_sq.detach().float().item():.8f}",
+                f"lambda={dynamic_lambda.detach().float().item():.8f}",
+            )
+
         return dynamic_lambda, grad_inner, grad_g_norm_sq
 
-    def compute_lambda(self, params):
-        lambda_value, _, _ = self._compute_dynamic_lambda_from_buffers(
-            device=next(iter(params.values())).device if params else torch.device("cpu")
-        )
-        return {
-            name: lambda_value.to(device=param.device, dtype=param.dtype)
-            for name, param in params.items()
-        }
-
-    def rewrite_grads(self, params, grad_f, grad_g, lambda_dict):
-        debug_rows = []
-        for name, param in params.items():
+    def _compose_final_grads(self, grad_f, grad_g, lambda_value):
+        final_grads = {}
+        all_names = set(grad_f) | set(grad_g)
+        for name in all_names:
             grad_pref = grad_f.get(name)
             grad_constraint = grad_g.get(name)
-            lam = lambda_dict.get(name)
             if grad_pref is None and grad_constraint is None:
                 continue
             if grad_pref is None:
                 grad_pref = torch.zeros_like(grad_constraint)
             if grad_constraint is None:
                 grad_constraint = torch.zeros_like(grad_pref)
-            if lam is None:
-                lam = torch.tensor(0.0, device=grad_pref.device, dtype=grad_pref.dtype)
-            target_dtype = self._grad_buffer_dtypes.get(name, grad_pref.dtype)
-            new_grad = (grad_pref + lam * grad_constraint).to(dtype=target_dtype)
+            final_grads[name] = grad_pref + lambda_value.to(device=grad_pref.device, dtype=grad_pref.dtype) * grad_constraint
+        return final_grads
+
+    def rewrite_grads(self, params, final_grads):
+        debug_rows = []
+        for name, param in params.items():
+            new_grad = final_grads.get(name)
+            if new_grad is None:
+                continue
+            target_dtype = self._grad_buffer_dtypes.get(name, new_grad.dtype)
+            new_grad = new_grad.to(dtype=target_dtype)
             safe_set_full_grad(param, new_grad)
 
             if self.grad_rewrite_debug and len(debug_rows) < 2:
-                orig_grad = grad_pref + grad_constraint
                 debug_rows.append(
                     {
                         "name": name,
-                        "orig_norm": orig_grad.float().norm().item(),
-                        "lambda": lam.float().mean().item(),
                         "new_norm": new_grad.float().norm().item(),
                     }
                 )
@@ -247,6 +382,14 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
     ) -> torch.Tensor:
         # logp是最容易拿到的，在这里做近似
         # 用policy和ref的logp差值平均值来近似KL divergence surrogate constraint g_hat
+        # Compute the KL surrogate in fp32. With bf16 + sum aggregation, policy/ref
+        # log-probs can be large-magnitude negatives, and their small differences are
+        # easily rounded to exactly zero before logging.
+        policy_chosen_logps = policy_chosen_logps.float()
+        policy_rejected_logps = policy_rejected_logps.float()
+        ref_chosen_logps = ref_chosen_logps.float()
+        ref_rejected_logps = ref_rejected_logps.float()
+
         chosen_kl = policy_chosen_logps - ref_chosen_logps
         rejected_kl = policy_rejected_logps - ref_rejected_logps
         surrogate_kl = 0.5 * (chosen_kl.mean() + rejected_kl.mean())
@@ -331,6 +474,7 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         preference_loss = batch_state["preference_loss"]
         constraint_value = batch_state["constraint_value"]
         policy_margin = batch_state["policy_margin"]
+        del batch_state
         loss = preference_loss
 
         sigmoid_margin = torch.sigmoid(policy_margin)
@@ -352,55 +496,58 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
 
         engine = self.deepspeed
         target_names = self._lambda_param_names(engine.module)
+        self._manual_micro_steps += 1
+        boundary = self._manual_micro_steps % self.args.gradient_accumulation_steps == 0
+        engine.set_gradient_accumulation_boundary(boundary)
+        self._maybe_debug_step_state(
+            "start",
+            engine,
+            boundary=boundary,
+        )
         engine.zero_grad()
         engine.backward(preference_loss, retain_graph=True)
-        params, grads_f = self.collect_full_grads(engine, target_names=target_names)
-        self._maybe_debug_grad_collection("after_backward", target_names, grads_f, "preference")
-        self._accumulate_grad_buffer(self._grad_f_buffer, grads_f)
+        _, grads_f_full = self.collect_full_grads(engine)
+        _, grads_f_target = self.collect_full_grads(engine, target_names=target_names)
+        self._maybe_debug_grad_collection("after_backward", target_names, grads_f_target, "preference")
+        self._accumulate_grad_buffer(self._final_grad_buffer, grads_f_full)
 
         engine.zero_grad()
         engine.backward(constraint_value)
-        _, grads_g = self.collect_full_grads(engine, target_names=target_names)
-        self._maybe_debug_grad_collection("after_backward", target_names, grads_g, "constraint")
-        self._accumulate_grad_buffer(self._grad_g_buffer, grads_g)
+        _, grads_g_full = self.collect_full_grads(engine)
+        _, grads_g_target = self.collect_full_grads(engine, target_names=target_names)
+        self._maybe_debug_grad_collection("after_backward", target_names, grads_g_target, "constraint")
+
+        lambda_value, grad_inner, grad_g_norm_sq = self._compute_dynamic_lambda_from_grads(
+            grads_f=grads_f_target,
+            grads_g=grads_g_target,
+            constraint_value=constraint_value,
+            device=preference_loss.device,
+        )
+        self._accumulate_scaled_grad_buffer(self._final_grad_buffer, grads_g_full, lambda_value)
         engine.zero_grad()
 
-        constraint_detached = constraint_value.detach()
-        if self._constraint_sum is None:
-            self._constraint_sum = constraint_detached
-        else:
-            self._constraint_sum = self._constraint_sum + constraint_detached
-        self._constraint_count += 1
+        metrics[f"{prefix}loss/dynamic_lambda"] = (
+            self.accelerator.gather_for_metrics(lambda_value.detach()).mean().item()
+        )
+        metrics[f"{prefix}loss/total"] = (
+            self.accelerator.gather_for_metrics(
+                (preference_loss + lambda_value.detach() * constraint_value).detach()
+            ).mean().item()
+        )
+        metrics[f"{prefix}grads/constraint_pref_inner"] = (
+            self.accelerator.gather_for_metrics(grad_inner.detach()).mean().item()
+        )
+        metrics[f"{prefix}grads/constraint_grad_norm_sq"] = (
+            self.accelerator.gather_for_metrics(grad_g_norm_sq.detach()).mean().item()
+        )
 
-        if engine.is_gradient_accumulation_boundary():
+        if boundary:
             all_params = {
                 name: param
                 for name, param in engine.module.named_parameters()
-                if param.requires_grad and param.numel() > 0 and name in target_names
+                if param.requires_grad and param.numel() > 0
             }
-            lambda_value, grad_inner, grad_g_norm_sq = self._compute_dynamic_lambda_from_buffers(
-                device=preference_loss.device
-            )
-            lambda_dict = {
-                name: lambda_value.to(device=param.device, dtype=param.dtype)
-                for name, param in all_params.items()
-            }
-            debug_rows = self.rewrite_grads(all_params, self._grad_f_buffer, self._grad_g_buffer, lambda_dict)
-
-            metrics[f"{prefix}loss/dynamic_lambda"] = (
-                self.accelerator.gather_for_metrics(lambda_value.detach()).mean().item()
-            )
-            metrics[f"{prefix}loss/total"] = (
-                self.accelerator.gather_for_metrics(
-                    (preference_loss + lambda_value.detach() * constraint_value).detach()
-                ).mean().item()
-            )
-            metrics[f"{prefix}grads/constraint_pref_inner"] = (
-                self.accelerator.gather_for_metrics(grad_inner.detach()).mean().item()
-            )
-            metrics[f"{prefix}grads/constraint_grad_norm_sq"] = (
-                self.accelerator.gather_for_metrics(grad_g_norm_sq.detach()).mean().item()
-            )
+            debug_rows = self.rewrite_grads(all_params, self._final_grad_buffer)
 
             if self.grad_rewrite_debug and self.state.global_step != self._last_grad_rewrite_step:
                 self._last_grad_rewrite_step = self.state.global_step
@@ -409,8 +556,6 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
                         "[grad_rewrite]",
                         f"step={self.state.global_step}",
                         f"name={row['name']}",
-                        f"orig_norm={row['orig_norm']:.6f}",
-                        f"lambda={row['lambda']:.6f}",
                         f"new_norm={row['new_norm']:.6f}",
                     )
 

@@ -29,7 +29,11 @@ def build_text(tokenizer, instruction: str, response: str) -> str:
     return f"### Instruction:\n{instruction}\n\n### Response:\n{response}\n"
 
 
-def iter_pairs(data: List[Dict[str, Any]], tokenizer) -> Iterable[Tuple[int, int, str]]:
+def iter_pairs(
+    data: List[Dict[str, Any]],
+    tokenizer,
+    first_only: bool = False,
+) -> Iterable[Tuple[int, int, str]]:
     """
     Yield (sample_idx, cand_idx, text_for_rm)
     """
@@ -38,6 +42,8 @@ def iter_pairs(data: List[Dict[str, Any]], tokenizer) -> Iterable[Tuple[int, int
         outs = ex.get("outputs", None)
         if not isinstance(outs, list):
             raise ValueError(f"Example {si} missing 'outputs' list.")
+        if first_only:
+            outs = outs[:1]
         for cj, resp in enumerate(outs):
             yield si, cj, build_text(tokenizer, instr, str(resp))
 
@@ -49,6 +55,7 @@ def score_stream(
     data: List[Dict[str, Any]],
     batch_size: int,
     max_length: int,
+    first_only: bool = False,
 ) -> None:
     """
     In-place write ex["reward"] as list[float] aligned with ex["outputs"].
@@ -57,17 +64,24 @@ def score_stream(
     # pre-allocate reward lists
     for ex in data:
         outs = ex.get("outputs", [])
-        ex["reward"] = [None] * len(outs)
+        if first_only:
+            ex["outputs"] = outs[:1]
+            outs = ex["outputs"]
+        reward_len = min(len(outs), 1) if first_only else len(outs)
+        ex["reward"] = [None] * reward_len
 
     # total candidates for progress bar
-    total = sum(len(ex["outputs"]) for ex in data)
+    if first_only:
+        total = sum(min(len(ex["outputs"]), 1) for ex in data)
+    else:
+        total = sum(len(ex["outputs"]) for ex in data)
 
     buf_texts: List[str] = []
     buf_indices: List[Tuple[int, int]] = []
 
     pbar = tqdm(total=total, desc="Scoring (RM)", unit="cand")
 
-    for si, cj, text in iter_pairs(data, tokenizer):
+    for si, cj, text in iter_pairs(data, tokenizer, first_only=first_only):
         buf_texts.append(text)
         buf_indices.append((si, cj))
 
@@ -127,6 +141,11 @@ def main():
     ap.add_argument("--max_length", type=int, default=4096, help="Max tokens for RM input")
     ap.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     ap.add_argument("--output_json", type=str, default=None, help="Output path (default=xxx-reward.json)")
+    ap.add_argument(
+        "--first_only",
+        action="store_true",
+        help="Only score outputs[0] for each example and write a length-1 reward list.",
+    )
     args = ap.parse_args()
 
     out_path = args.output_json or default_out_path(args.input_json)
@@ -155,7 +174,10 @@ def main():
     )
     model.eval()
 
-    total = sum(len(ex.get("outputs", [])) for ex in data)
+    if args.first_only:
+        total = sum(min(len(ex.get("outputs", [])), 1) for ex in data)
+    else:
+        total = sum(len(ex.get("outputs", [])) for ex in data)
     print(f"Scoring {total} candidate responses...")
 
     score_stream(
@@ -164,6 +186,7 @@ def main():
         data=data,
         batch_size=args.batch_size,
         max_length=args.max_length,  # keep 4096
+        first_only=args.first_only,
     )
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
