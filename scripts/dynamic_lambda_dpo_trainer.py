@@ -34,6 +34,7 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         self.grad_collection_debug = os.getenv("DYNAMIC_LAMBDA_GRAD_DEBUG", "0") == "1"
         self._manual_micro_steps = 0
         self._cached_micro_batches = []
+        self._tracked_param_name = None
 
     def _trainable_grad_params(self, model):
         return [(name, param) for name, param in model.named_parameters() if param.requires_grad and param.numel() > 0]
@@ -82,6 +83,33 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
         target_names = set(self._lambda_param_names(model))
         return [param for name, param in model.named_parameters() if name in target_names]
 
+    def _get_tracked_param_name(self, model):
+        if self._tracked_param_name is not None:
+            return self._tracked_param_name
+        target_names = self._lambda_param_names(model)
+        self._tracked_param_name = target_names[0] if target_names else None
+        return self._tracked_param_name
+
+    def _debug_step_param_update(self, model, before_step_snapshot):
+        if not self.grad_collection_debug or before_step_snapshot is None:
+            return
+        param_name = self._get_tracked_param_name(model)
+        if param_name is None:
+            return
+        for name, param in model.named_parameters():
+            if name != param_name:
+                continue
+            after_step = param.detach().float().cpu()
+            mean_abs = (after_step - before_step_snapshot).abs().mean().item()
+            max_abs = (after_step - before_step_snapshot).abs().max().item()
+            rank = getattr(self.accelerator, "process_index", 0)
+            print(
+                f"[dlambda_param_update] rank={rank} param={param_name} "
+                f"mean_abs={mean_abs:.12e} max_abs={max_abs:.12e}",
+                flush=True,
+            )
+            return
+
     @contextmanager
     def _freeze_except(self, model, target_names):
         target_names = set(target_names)
@@ -127,7 +155,7 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
             grad = safe_get_full_grad(param)
             if grad is None:
                 continue
-            grads[name] = grad.detach().float()
+            grads[name] = grad.detach()
         return grads
 
     def _add_grad_dicts(self, acc, new):
@@ -331,6 +359,16 @@ class DynamicLambdaDPOTrainer(DPOMetricsTrainer):
             engine, self.accelerator.device
         )
         second_stage = self._second_stage_backward(engine, lambda_value, self.accelerator.device)
+        before_step_snapshot = None
+        if self.grad_collection_debug:
+            tracked_name = self._get_tracked_param_name(model)
+            if tracked_name is not None:
+                for name, param in model.named_parameters():
+                    if name == tracked_name:
+                        before_step_snapshot = param.detach().float().cpu().clone()
+                        break
+        engine.step()
+        self._debug_step_param_update(model, before_step_snapshot)
         self._reset_cached_batches()
 
         metrics = {

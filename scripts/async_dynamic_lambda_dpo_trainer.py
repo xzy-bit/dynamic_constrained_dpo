@@ -109,6 +109,15 @@ class AsyncDynamicLambdaDPOTrainer(DynamicLambdaDPOTrainer):
         next_lambda = torch.tensor(self._async_lambda, device=preference_loss.device, dtype=torch.float32)
 
         if boundary:
+            before_step_snapshot = None
+            if self.grad_collection_debug:
+                tracked_name = self._get_tracked_param_name(model)
+                if tracked_name is not None:
+                    for name, param in model.named_parameters():
+                        if name == tracked_name:
+                            before_step_snapshot = param.detach().float().cpu().clone()
+                            break
+
             mean_constraint_value = self._mean_constraint_value(preference_loss.device)
             next_lambda, grad_inner, grad_g_norm_sq = self._compute_dynamic_lambda_from_grads(
                 grads_f=self._target_grad_f_buffer,
@@ -141,6 +150,8 @@ class AsyncDynamicLambdaDPOTrainer(DynamicLambdaDPOTrainer):
 
             self._next_async_lambda = float(next_lambda.detach().item())
             self._async_lambda = self._next_async_lambda
+            engine.step()
+            self._debug_step_param_update(model, before_step_snapshot)
             self._reset_async_state()
 
         metrics = {
