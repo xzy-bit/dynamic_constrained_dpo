@@ -8,6 +8,6 @@ completions_kwargs:
   stop_token_ids:
     - 128001
     - 128009
-  temperature: 0.6
+  temperature: 0.9
   top_p: 1.0
 prompt_template: eval/alpacaeval/templates/llama3.txt

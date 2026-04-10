@@ -7,20 +7,14 @@ dataset_name: HuggingFaceH4/ultrafeedback_binarized
 dataset_config: default
 dataset_train_split: train_prefs
 
-# DynamicLambdaDPOTrainer arguments
+# HyPO DPO arguments
 bf16: true
-beta: 2.5
-dlambda_alpha: 1.0
-dlambda_epsilon: 0.0008
-dlambda_lambda_max: 20.0
-dlambda_grad_target: last_layer_down_proj
-dlambda_reference_free: false
-dlambda_logp_aggregation: mean
-dlambda_kl_normalize_by_length: true
-dlambda_apply_beta_to_preference: true
-dlambda_barrier_mu: 0.0
+beta: 0.01
+im_enable: true
+im_gamma: 0.0
+im_tau: 0.1
 do_eval: false
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: False
@@ -34,7 +28,7 @@ num_train_epochs: 1
 optim: adamw_torch
 adam_beta1: 0.9
 adam_beta2: 0.999
-output_dir: results/model/dynamic_lambda_dpo_llama32_1b
+output_dir: results/model/hypo_dpo_llama32_1b
 per_device_train_batch_size: 4
 report_to:
 - wandb

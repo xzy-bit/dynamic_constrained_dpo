@@ -248,6 +248,21 @@ def main(script_args, training_args, model_args,trainer_name: str = "dpo"):
             dlambda_grad_target=training_args.dlambda_grad_target,
             dlambda_reference_free=training_args.dlambda_reference_free,
             dlambda_logp_aggregation=training_args.dlambda_logp_aggregation,
+            dlambda_kl_normalize_by_length=getattr(training_args, "dlambda_kl_normalize_by_length", True),
+            dlambda_barrier_mu=getattr(training_args, "dlambda_barrier_mu", 0.0),
+            dlambda_apply_beta_to_preference=getattr(training_args, "dlambda_apply_beta_to_preference", True),
+        )
+    elif trainer_name == "hypo_dpo":
+        trainer = TrainerCls(
+            model,
+            ref_model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            peft_config=get_peft_config(model_args),
+            im_enable=getattr(training_args, "im_enable", True),
+            im_gamma=getattr(training_args, "im_gamma", 0.0),
+            im_tau=getattr(training_args, "im_tau", 0.0),
         )
     elif trainer_name == "sp_dpo":
         trainer = TrainerCls(

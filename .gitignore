@@ -162,6 +162,17 @@ cython_debug/
 # Temp folders
 data/
 wandb/
-# Generated response outputs
-responses/*.json
+logs/
+
+# Generated response outputs & training results
+responses/
 results/
+
+# Seeking / debug logs
+seeking/
+
+# Codex / AI tool caches
+.codex
+
+# Local HF cache (if created by old scripts)
+.cache/
